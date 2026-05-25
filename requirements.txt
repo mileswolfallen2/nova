@@ -1,0 +1,8 @@
+requests>=2.31.0
+sounddevice>=0.4.6
+vosk==0.3.44
+duckduckgo-search>=6.2.0
+TTS
+torch
+numpy
+scipy

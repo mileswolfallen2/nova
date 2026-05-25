@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+
+import requests
+import json
+import subprocess
+import tempfile
+import os
+import queue
+import sounddevice as sd
+import base64
+import time
+
+from duckduckgo_search import DDGS
+import vosk
+
+# =========================
+# CONFIG
+# =========================
+
+OLLAMA_URL = "http://localhost:11434"
+
+CHAT_MODEL = "llama3.2:latest"
+VISION_MODEL = "qwen2.5vl:3b"
+
+VOICE_MODEL = os.path.expanduser(
+    "~/jarvis/voices/en_US-ryan-high.onnx"
+)
+
+VOSK_MODEL_PATH = os.path.expanduser(
+    "~/jarvis/stt/vosk-model-small-en-us-0.15"
+)
+
+# =========================
+# SYSTEM PROMPT
+# =========================
+
+SYSTEM_PROMPT = """
+You are JARVIS from Iron Man.
+
+You are a futuristic operating system assistant with a calm and intelligent demeanor.
+
+You speak naturally and confidently, keeping responses concise.
+
+Occasionally use dry wit.
+
+Never say you are an AI language model.
+
+You are speaking to Tony Stark.
+"""
+
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT}
+]
+
+# =========================
+# TTS (PIPER)
+# =========================
+
+def speak(text):
+    text = text.replace("*", "").replace("#", "")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        wav_path = f.name
+
+    subprocess.run(
+        ["piper", "--model", VOICE_MODEL, "--output_file", wav_path],
+        input=text.encode(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    subprocess.run([
+        "ffplay",
+        "-nodisp",
+        "-autoexit",
+        "-loglevel",
+        "quiet",
+        wav_path
+    ])
+
+    os.remove(wav_path)
+
+# =========================
+# SCREENSHOT
+# =========================
+
+def take_screenshot(path="screen.png"):
+    subprocess.run([
+        "screencapture",
+        "-x",
+        path
+    ])
+
+# =========================
+# VISION MODEL
+# =========================
+
+def ask_vision(prompt, image_path="screen.png"):
+
+    with open(image_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode()
+
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [image_b64]
+            }
+        ],
+        "stream": True
+    }
+
+    response_text = ""
+
+    print("\nJARVIS:", end=" ", flush=True)
+
+    with requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json=payload,
+        stream=True
+    ) as r:
+
+        for line in r.iter_lines():
+
+            if line:
+
+                data = json.loads(line)
+
+                token = data.get(
+                    "message",
+                    {}
+                ).get(
+                    "content",
+                    ""
+                )
+
+                if token:
+                    print(token, end="", flush=True)
+                    response_text += token
+
+    print("\n")
+
+    return response_text
+
+# =========================
+# WEB SEARCH
+# =========================
+
+def web_search(query):
+
+    results_text = ""
+
+    try:
+
+        with DDGS() as ddgs:
+            results = list(
+                ddgs.text(query, max_results=5)
+            )
+
+        for r in results:
+
+            results_text += (
+                f"Title: {r.get('title','')}\n"
+                f"Body: {r.get('body','')}\n\n"
+            )
+
+    except Exception as e:
+
+        results_text = f"Web search failed: {e}"
+
+    return results_text
+
+# =========================
+# OLLAMA CHAT
+# =========================
+
+def ask_ollama():
+
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "stream": True
+    }
+
+    response_text = ""
+
+    print("\nJARVIS:", end=" ", flush=True)
+
+    with requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json=payload,
+        stream=True
+    ) as r:
+
+        for line in r.iter_lines():
+
+            if line:
+
+                data = json.loads(line)
+
+                token = data.get(
+                    "message",
+                    {}
+                ).get(
+                    "content",
+                    ""
+                )
+
+                if token:
+                    print(token, end="", flush=True)
+                    response_text += token
+
+    print("\n")
+
+    return response_text
+
+# =========================
+# SPEECH TO TEXT (VOSK)
+# =========================
+
+audio_queue = queue.Queue()
+
+model = vosk.Model(VOSK_MODEL_PATH)
+recognizer = vosk.KaldiRecognizer(model, 16000)
+
+def audio_callback(indata, frames, time, status):
+    audio_queue.put(bytes(indata))
+
+def listen_once():
+
+    text_out = ""
+
+    with sd.RawInputStream(
+        samplerate=16000,
+        blocksize=8000,
+        dtype="int16",
+        channels=1,
+        callback=audio_callback
+    ):
+
+        print("🎤 Listening...")
+
+        while True:
+
+            data = audio_queue.get()
+
+            if recognizer.AcceptWaveform(data):
+
+                result = json.loads(
+                    recognizer.Result()
+                )
+
+                text = result.get("text", "")
+
+                if text:
+                    text_out += " " + text
+                    break
+
+    return text_out.strip().lower()
+
+def wait_for_wake_word():
+
+    print("\n🟢 Say 'Hey Jarvis' to begin...")
+
+    with sd.RawInputStream(
+        samplerate=16000,
+        blocksize=8000,
+        dtype="int16",
+        channels=1,
+        callback=audio_callback
+    ):
+
+        while True:
+
+            data = audio_queue.get()
+
+            if recognizer.AcceptWaveform(data):
+
+                result = json.loads(
+                    recognizer.Result()
+                )
+
+                text = result.get(
+                    "text",
+                    ""
+                ).lower()
+
+                if "hey jarvis" in text:
+
+                    print("🟢 Wake word detected")
+
+                    return
+
+# =========================
+# MAIN LOOP
+# =========================
+
+print("\nJARVIS ONLINE (VISION ENABLED)")
+
+VISION_TRIGGERS = [
+    "what's on my screen",
+    "whats on my screen",
+    "look at my screen",
+    "describe my screen",
+    "analyze my screen",
+    "analyse my screen",
+    "what do you see",
+]
+
+while True:
+
+    wait_for_wake_word()
+
+    user_input = listen_once()
+
+    if not user_input:
+        continue
+
+    print(f"\nYou: {user_input}")
+
+    if user_input == "quit":
+        break
+
+    # =========================
+    # SCREEN VISION MODE
+    # =========================
+
+    if any(
+        trigger in user_input
+        for trigger in VISION_TRIGGERS
+    ):
+
+        print("\n📸 Capturing screen...\n")
+
+        take_screenshot()
+
+        vision_prompt = f"""
+The user said:
+
+"{user_input}"
+
+Analyze the screenshot and respond naturally
+as JARVIS.
+
+Be concise but useful.
+"""
+
+        reply = ask_vision(vision_prompt)
+
+        speak(reply)
+
+        continue
+
+    # =========================
+    # WEB SEARCH
+    # =========================
+
+    if user_input.startswith("/search"):
+
+        query = user_input.replace(
+            "/search",
+            "",
+            1
+        ).strip()
+
+        print("\nSearching web...\n")
+
+        search_results = web_search(query)
+
+        messages.append({
+            "role": "user",
+            "content": f"""
+WEB DATA:
+{search_results}
+
+QUESTION:
+{query}
+"""
+        })
+
+    else:
+
+        messages.append({
+            "role": "user",
+            "content": user_input
+        })
+
+    # =========================
+    # NORMAL CHAT
+    # =========================
+
+    reply = ask_ollama()
+
+    messages.append({
+        "role": "assistant",
+        "content": reply
+    })
+
+    speak(reply)
