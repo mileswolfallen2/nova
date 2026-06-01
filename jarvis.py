@@ -2,6 +2,7 @@
 # NOVA Voice Assistant
 
 import requests
+import asyncio
 import json
 import subprocess
 import tempfile
@@ -61,6 +62,9 @@ OLLAMA_URL = "http://localhost:11434"
 CHAT_MODEL = "llama3.2:latest"
 VISION_MODEL = "llava:7b"
 
+TTS_BACKEND = "edge"  # "edge" or "piper"
+EDGE_TTS_VOICE = "en-GB-RyanNeural"
+
 VOICE_MODEL = os.path.expanduser("~/jarvis/voices/en_US-lessac-high.onnx")
 
 VOSK_MODEL_PATH = os.path.expanduser(
@@ -99,7 +103,10 @@ SYSTEM_PROMPT = """
 You are NOVA.
 
 You are a system assistant.
-
+You are a refined British-style computer assistant.
+Speak calmly, intelligently, and with dry wit.
+Be concise, composed, and slightly formal.
+Never claim you performed an action unless a command actually did it.
 Be concise.
 
 Never mention being an AI.
@@ -239,6 +246,28 @@ def play_chime():
 # TTS
   
 
+async def synthesize_edge_tts(text, audio_path):
+    import edge_tts
+
+    communicate = edge_tts.Communicate(text, EDGE_TTS_VOICE)
+    await communicate.save(audio_path)
+
+
+def synthesize_piper(text, audio_path):
+    subprocess.run(
+        [
+            "piper",
+            "--model",
+            VOICE_MODEL,
+            "--output_file",
+            audio_path,
+        ],
+        input=text.encode(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+
 
 def speak(text):
     global speech_process
@@ -248,21 +277,27 @@ def speak(text):
     if TEXT_MODE:
         return
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav_path = f.name
+    suffix = ".mp3" if TTS_BACKEND == "edge" else ".wav"
 
-    subprocess.run(
-        [
-            "piper",
-            "--model",
-            VOICE_MODEL,
-            "--output_file",
-            wav_path,
-        ],
-        input=text.encode(),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        audio_path = f.name
+
+    try:
+        if TTS_BACKEND == "edge":
+            asyncio.run(synthesize_edge_tts(text, audio_path))
+        else:
+            synthesize_piper(text, audio_path)
+    except Exception as e:
+        dbg("TTS", f"{TTS_BACKEND} failed: {e}")
+        try:
+            synthesize_piper(text, audio_path)
+        except Exception as fallback_error:
+            dbg("TTS", f"piper fallback failed: {fallback_error}")
+            try:
+                os.remove(audio_path)
+            except:
+                pass
+            return
 
     speech_process = subprocess.Popen(
         [
@@ -271,14 +306,14 @@ def speak(text):
             "-autoexit",
             "-loglevel",
             "quiet",
-            wav_path,
+            audio_path,
         ]
     )
 
     speech_process.wait()
 
     try:
-        os.remove(wav_path)
+        os.remove(audio_path)
     except:
         pass
 
@@ -390,11 +425,25 @@ def play_youtube_music(query):
 def browser_click(selector):
     try:
         init_browser()
-        try:
-            page.click(selector, timeout=5000)
-        except:
-            page.get_by_text(selector).first.click()
-        return f"Clicked '{selector}'"
+
+        click_attempts = [
+            lambda: page.click(selector, timeout=3000),
+            lambda: page.get_by_role("button", name=selector).click(timeout=3000),
+            lambda: page.get_by_role("link", name=selector).click(timeout=3000),
+            lambda: page.get_by_label(selector).click(timeout=3000),
+            lambda: page.get_by_text(selector, exact=True).first.click(timeout=3000),
+            lambda: page.get_by_text(selector).first.click(timeout=3000),
+        ]
+
+        last_error = None
+        for attempt in click_attempts:
+            try:
+                attempt()
+                return f"Clicked '{selector}'"
+            except Exception as e:
+                last_error = e
+
+        raise last_error
     except Exception as e:
         return str(e)
 
@@ -402,11 +451,23 @@ def browser_click(selector):
 def browser_type(selector, text):
     try:
         init_browser()
-        try:
-            page.fill(selector, text)
-        except:
-            page.get_by_placeholder(selector).fill(text)
-        return f"Typed into '{selector}'"
+
+        type_attempts = [
+            lambda: page.fill(selector, text, timeout=3000),
+            lambda: page.get_by_placeholder(selector).fill(text, timeout=3000),
+            lambda: page.get_by_label(selector).fill(text, timeout=3000),
+            lambda: page.get_by_role("textbox", name=selector).fill(text, timeout=3000),
+        ]
+
+        last_error = None
+        for attempt in type_attempts:
+            try:
+                attempt()
+                return f"Typed into '{selector}'"
+            except Exception as e:
+                last_error = e
+
+        raise last_error
     except Exception as e:
         return str(e)
 
@@ -428,9 +489,237 @@ def browser_read_page():
         return str(e)
 
 
+def browser_interactive_snapshot():
+    try:
+        return page.evaluate(
+            """() => {
+            const items = [];
+            const candidates = Array.from(document.querySelectorAll(
+                'a, button, input, textarea, select, [role="button"], [role="link"], [role="textbox"]'
+            ));
+
+            for (const el of candidates.slice(0, 80)) {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                if (
+                    rect.width < 1 ||
+                    rect.height < 1 ||
+                    style.visibility === 'hidden' ||
+                    style.display === 'none'
+                ) {
+                    continue;
+                }
+
+                const label = (
+                    el.innerText ||
+                    el.value ||
+                    el.getAttribute('aria-label') ||
+                    el.getAttribute('placeholder') ||
+                    el.getAttribute('name') ||
+                    el.getAttribute('title') ||
+                    ''
+                ).replace(/\\s+/g, ' ').trim().slice(0, 100);
+
+                const tag = el.tagName.toLowerCase();
+                const role = el.getAttribute('role') || '';
+                const type = el.getAttribute('type') || '';
+                const placeholder = el.getAttribute('placeholder') || '';
+                const name = el.getAttribute('name') || '';
+                const id = el.id || '';
+
+                items.push({ tag, role, type, label, placeholder, name, id });
+            }
+
+            return JSON.stringify(items.slice(0, 40), null, 2);
+        }"""
+        )
+    except Exception as e:
+        dbg("BROWSER", f"Interactive snapshot failed: {e}")
+        return "[]"
+
+
   
 # BROWSER — AGENTIC LOOP
   
+
+
+def extract_url(text):
+    match = re.search(r"https?://\S+", text)
+    if match:
+        return match.group(0).rstrip(".,)")
+    return None
+
+
+def ask_form_model(prompt):
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Answer form questions accurately and briefly. "
+                    "Return only the answer text. No explanation."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=20)
+        answer = r.json()["message"]["content"].strip()
+        answer = re.sub(r"^['\"]|['\"]$", "", answer)
+        return answer
+    except Exception as e:
+        dbg("FORM", f"Answer model failed: {e}")
+        return ""
+
+
+def default_form_answer(label):
+    lower_label = label.lower()
+    if "email" in lower_label:
+        return "miles@example.com"
+    if "name" in lower_label:
+        return "Miles Allen"
+    if "phone" in lower_label:
+        return "555-555-5555"
+    if "age" in lower_label:
+        return "18"
+    if "date" in lower_label:
+        return datetime.now().strftime("%m/%d/%Y")
+
+    answer = ask_form_model(
+        f"Question: {label}\nGive the shortest accurate answer that should go in the form."
+    )
+
+    if answer:
+        return answer
+
+    return "I don't know"
+
+
+def choose_form_option(label, options):
+    if not options:
+        return None
+
+    option_list = "\n".join(f"- {option}" for option in options)
+    answer = ask_form_model(
+        "Choose the best option for this form question.\n\n"
+        f"Question: {label}\n"
+        f"Options:\n{option_list}\n\n"
+        "Return exactly one option from the list."
+    )
+
+    for option in options:
+        if answer.lower().strip() == option.lower().strip():
+            return option
+
+    for option in options:
+        if option.lower().strip() in answer.lower():
+            return option
+
+    return options[0]
+
+
+def fill_google_form(goal):
+    url = extract_url(goal)
+    if not url:
+        return None
+
+    init_browser()
+    page.goto(url, wait_until="domcontentloaded")
+    time.sleep(2)
+
+    if "docs.google.com/forms" not in page.url:
+        return None
+
+    filled = 0
+    selected = 0
+    questions = page.locator('div[role="listitem"]')
+    question_count = questions.count()
+
+    for i in range(question_count):
+        question = questions.nth(i)
+        try:
+            label = question.inner_text(timeout=2000).splitlines()[0]
+        except:
+            label = "question"
+
+        fields = question.locator(
+            'input[type="text"], input[type="email"], '
+            'input[type="number"], textarea'
+        )
+
+        for j in range(fields.count()):
+            field = fields.nth(j)
+            try:
+                if field.is_visible() and field.input_value() == "":
+                    field.fill(default_form_answer(label))
+                    filled += 1
+            except Exception as e:
+                dbg("FORM", f"Fill failed: {e}")
+
+        choices = question.locator(
+            'div[role="radio"]:not([aria-disabled="true"]), '
+            'div[role="checkbox"]:not([aria-disabled="true"])'
+        )
+
+        try:
+            choice_count = choices.count()
+            if choice_count and choices.first.is_visible():
+                options = []
+                for j in range(choice_count):
+                    choice = choices.nth(j)
+                    option = (
+                        choice.get_attribute("aria-label")
+                        or choice.inner_text(timeout=1000)
+                    )
+                    option = re.sub(r"\s+", " ", option).strip()
+                    if option:
+                        options.append(option)
+
+                selected_option = choose_form_option(label, options)
+                selected_index = 0
+                if selected_option in options:
+                    selected_index = options.index(selected_option)
+
+                choice = choices.nth(selected_index)
+                checked = choice.get_attribute("aria-checked")
+                if checked != "true":
+                    choice.click()
+                    selected += 1
+        except Exception as e:
+            dbg("FORM", f"Choice failed: {e}")
+
+    should_submit = any(
+        word in goal.lower()
+        for word in ["submit", "send the form", "turn it in"]
+    )
+
+    if should_submit:
+        try:
+            page.get_by_text("Submit", exact=True).click(timeout=5000)
+            return (
+                "Filled the form and submitted it. "
+                f"Filled {filled} fields and selected {selected} choices."
+            )
+        except Exception as e:
+            dbg("FORM", f"Submit failed: {e}")
+            return (
+                "Filled the form, but I could not submit it. "
+                f"Filled {filled} fields and selected {selected} choices."
+            )
+
+    if filled or selected:
+        return (
+            "Filled the form. "
+            f"Filled {filled} fields and selected {selected} choices. "
+            "I did not submit it."
+        )
+
+    return "I opened the form, but I could not find fillable questions."
 
 
 def run_browser_agent(goal):
@@ -441,6 +730,10 @@ def run_browser_agent(goal):
     """
     try:
         init_browser()
+        form_result = fill_google_form(goal)
+        if form_result:
+            return form_result
+
         max_steps = 10
         step = 0
 
@@ -462,11 +755,16 @@ def run_browser_agent(goal):
             except:
                 snapshot = ""
 
+            interactive = browser_interactive_snapshot()
+
             prompt = f"""You are controlling a real web browser to accomplish this goal: "{goal}"
 
 Current page: "{current_title}" at {current_url}
 Visible page text (first 1500 chars):
 {snapshot}
+
+Visible interactive elements:
+{interactive}
 
 Decide the single best next action. Respond ONLY with one JSON object from the options below:
   {{"action": "navigate", "url": "https://..."}}
@@ -474,10 +772,14 @@ Decide the single best next action. Respond ONLY with one JSON object from the o
   {{"action": "type", "selector": "CSS selector or placeholder text", "text": "text to type"}}
   {{"action": "press", "key": "Enter"}}
   {{"action": "scroll", "direction": "down"}}
+  {{"action": "back"}}
+  {{"action": "forward"}}
   {{"action": "wait", "seconds": 2}}
   {{"action": "done", "summary": "brief description of what was accomplished"}}
 
 Tips:
+- If the user did not provide a URL, work on the current page.
+- Prefer exact visible button/link/input text from the interactive elements list.
 - On YouTube, click the video title text to play it (e.g. the first search result title).
 - After navigating to a new page, issue a wait action to let it load before interacting.
 - If a cookie/consent banner appears, click the accept or dismiss button first.
@@ -488,6 +790,8 @@ Return raw JSON only. No explanation. No markdown fences."""
             payload = {
                 "model": CHAT_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
+                "format": "json",
+                "options": {"temperature": 0},
                 "stream": False,
             }
 
@@ -502,7 +806,7 @@ Return raw JSON only. No explanation. No markdown fences."""
             dbg("AGENT", f"Step {step}: {raw}")
 
             try:
-                action = json.loads(raw)
+                action = json.loads(clean_json(raw))
             except json.JSONDecodeError:
                 dbg("AGENT", f"Bad JSON on step {step}, skipping")
                 continue
@@ -544,6 +848,12 @@ Return raw JSON only. No explanation. No markdown fences."""
                 page.keyboard.press(
                     "PageDown" if direction == "down" else "PageUp"
                 )
+
+            elif a == "back":
+                page.go_back(wait_until="domcontentloaded")
+
+            elif a == "forward":
+                page.go_forward(wait_until="domcontentloaded")
 
             elif a == "wait":
                 secs = min(action.get("seconds", 2), 5)  # cap at 5s
@@ -860,13 +1170,110 @@ def extract_music_query(text):
     return query
 
 
+def extract_google_query(text):
+    query = re.sub(
+        r"\b(thanks|thenks|thank you|please|plz)\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r".*?\b(?:google|search google|search for|look up|find)\b",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"\b(open|launch|go to|and|for|on|the|a|browser)\b",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\s+", " ", query).strip(" .")
+    return query
+
+
 def obvious_action_decision(user_input, decision):
     text = user_input.lower()
     url = first_url(user_input)
     is_command = decision.get("type") == "command"
 
+    greetings = ["hi", "hello", "hey", "yo", "sup"]
+    if text.strip(" .!?") in greetings:
+        return {"type": "chat"}
+
+    chat_question_words = [
+        "what time",
+        "what itme",
+        "tell me",
+        "explain",
+        "why",
+        "how",
+        "who",
+        "when",
+        "where",
+    ]
+    if any(phrase in text for phrase in chat_question_words) and not url:
+        command_name = decision.get("command")
+        if command_name in [
+            "get_system_status",
+            "get_weather",
+            "spotify_play",
+            "spotify_pause",
+            "spotify_next",
+            "stop_speaking",
+        ]:
+            return {"type": "chat"}
+
+    if decision.get("command") == "get_system_status":
+        status_words = [
+            "system status",
+            "cpu",
+            "ram",
+            "memory usage",
+            "disk usage",
+            "computer status",
+            "performance",
+        ]
+        if not any(word in text for word in status_words):
+            return {"type": "chat"}
+
+    if decision.get("command") == "get_weather":
+        if "weather" not in text and "temperature" not in text:
+            return {"type": "chat"}
+
     music_words = ["music", "song", "songs", "playlist", "video"]
     browser_words = ["browser", "youtube", "youtueb", "yt"]
+    google_words = ["google", "search google", "search for", "look up"]
+    current_page_action_words = [
+        "click",
+        "press",
+        "type",
+        "fill",
+        "scroll",
+        "read the page",
+        "what is on this page",
+        "what's on this page",
+        "open this",
+        "select",
+        "choose",
+        "search",
+        "log in",
+        "login",
+        "sign in",
+        "submit",
+        "go back",
+        "go forward",
+    ]
+
+    if "google" in text and "search" in text:
+        query = extract_google_query(user_input)
+        if query:
+            return {
+                "type": "command",
+                "command": "google_search",
+                "args": {"query": query},
+            }
 
     if "play" in text and any(word in text for word in music_words):
         if any(word in text for word in browser_words) or "youtube" not in text:
@@ -912,6 +1319,22 @@ def obvious_action_decision(user_input, decision):
             "args": {"goal": user_input},
         }
 
+    if not is_command and any(word in text for word in google_words):
+        query = extract_google_query(user_input)
+        if query:
+            return {
+                "type": "command",
+                "command": "google_search",
+                "args": {"query": query},
+            }
+
+    if any(word in text for word in current_page_action_words):
+        return {
+            "type": "command",
+            "command": "run_browser_agent",
+            "args": {"goal": user_input},
+        }
+
     return decision
 
 
@@ -946,6 +1369,12 @@ Return ONLY raw JSON in one of these forms:
 {{"type": "chat"}}
 
 Rules:
+- For greetings like "hi", "hello", and "hey", return chat.
+- For normal questions, return chat unless the user clearly requests one of the
+  available commands.
+- Only choose get_system_status if the user asks for system status, CPU, RAM,
+  memory usage, disk usage, computer status, or performance.
+- Only choose get_weather if the user asks for weather or temperature.
 - Use only command names from the available commands list.
 - Extract all required args from the user's words.
 - For run_browser_agent, pass the full user request as goal.
@@ -955,6 +1384,11 @@ Rules:
   choose play_youtube_music.
 - If the user asks to open a browser and play/search/watch/navigate/click/read,
   choose run_browser_agent instead of chat.
+- If the user asks to open Google and search for something, choose
+  google_search and extract the search terms.
+- If the user asks to click, type, fill, scroll, read, select, search, log in,
+  sign in, or submit without giving a URL, choose run_browser_agent and use the
+  current browser page.
 - If the user asks for YouTube plus playing music or a video, choose
   play_youtube_music, even if YouTube is misspelled.
 - If the user only asks to search YouTube, choose youtube_search.
@@ -976,10 +1410,25 @@ Output: {{"type": "command", "command": "play_youtube_music", "args": {{"query":
 User input: youtube woodworking
 Output: {{"type": "command", "command": "youtube_search", "args": {{"query": "woodworking"}}}}
 
+User input: thenks open google and search for phots
+Output: {{"type": "command", "command": "google_search", "args": {{"query": "phots"}}}}
+
 User input: go to https://example.com/form and fill out the form
 Output: {{"type": "command", "command": "run_browser_agent", "args": {{"goal": "go to https://example.com/form and fill out the form"}}}}
 
+User input: click sign in
+Output: {{"type": "command", "command": "run_browser_agent", "args": {{"goal": "click sign in"}}}}
+
+User input: type miles into the username box
+Output: {{"type": "command", "command": "run_browser_agent", "args": {{"goal": "type miles into the username box"}}}}
+
 User input: can you tell me why you do not use your skills?
+Output: {{"type": "chat"}}
+
+User input: hi
+Output: {{"type": "chat"}}
+
+User input: can you tell me whut itme it is in alstaley if it is 10:53 in minasota
 Output: {{"type": "chat"}}
 
 User input: {user_input}
