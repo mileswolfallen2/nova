@@ -98,16 +98,20 @@ logging.basicConfig(
 SYSTEM_PROMPT = """
 You are NOVA.
 
-You are a system assistant.
+You are a futuristic operating system assistant.
 
 Be concise.
 
 Never mention being an AI.
 
 You are speaking to Miles Allen.
-When the user asks for an action, the command router will handle it before chat.
-If you are chatting, do not claim that you opened apps, controlled websites,
-sent messages, played music, changed settings, or performed system actions.
+you can control the web browser, check the weather, read system status, send messages on Discord, control Spotify, and remember things for later. thes r commands are for your reference but do not mention them to the user unless they asked for help with commands:
+- To check the weather: "what's the weather" or "weather"
+- To check system status: "system status"
+- To control Spotify: "pause spotify", "play spotify", "next song"
+- To search Google: "google [search query]"
+- To search YouTube: "youtube [search query]"
+- To open a website: "open website [url]"
 """
 
 
@@ -346,47 +350,6 @@ def youtube_search(query):
         return str(e)
 
 
-def play_youtube_music(query):
-    try:
-        init_browser()
-        encoded = urllib.parse.quote_plus(query or "music")
-        page.goto(
-            f"https://www.youtube.com/results?search_query={encoded}",
-            wait_until="domcontentloaded",
-        )
-        time.sleep(2)
-
-        for text in ["Accept all", "I agree", "No thanks"]:
-            try:
-                page.get_by_text(text, exact=True).click(timeout=1500)
-                time.sleep(1)
-                break
-            except:
-                pass
-
-        selectors = [
-            "ytd-video-renderer a#video-title",
-            "a#video-title",
-            "ytd-rich-grid-media a#video-title-link",
-        ]
-
-        for selector in selectors:
-            try:
-                first_video = page.locator(selector).first
-                first_video.wait_for(state="visible", timeout=10000)
-                title = first_video.inner_text().strip()
-                first_video.click()
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-                return f"Playing {title or query} on YouTube."
-            except Exception as e:
-                dbg("YOUTUBE", f"{selector} failed: {e}")
-
-        return "I opened YouTube, but I couldn't start the first video."
-
-    except Exception as e:
-        return str(e)
-
-
 def browser_click(selector):
     try:
         init_browser()
@@ -566,6 +529,33 @@ Return raw JSON only. No explanation. No markdown fences."""
 
 
   
+# BROWSER — INTENT KEYWORDS
+  
+
+BROWSER_KEYWORDS = [
+    "in the browser",
+    "on the page",
+    "click ",
+    "scroll ",
+    "fill in",
+    "type into",
+    "read the page",
+    "what does the page say",
+    "what's on the page",
+    "go to ",
+    "navigate to ",
+    "open the browser",
+    "open youtube",
+    "open google",
+    "play ",
+    "search for ",
+    "find on youtube",
+    "watch ",
+    "browse ",
+]
+
+
+  
 # DISCORD AUTOMATION
   
 
@@ -619,6 +609,53 @@ def cancel_discord_send():
 
 
   
+# DISCORD — INTENT INFERENCE
+  
+
+DISCORD_INTENT_PROMPT = """
+Extract a Discord message intent from the user input.
+Return ONLY a JSON object with keys "recipient" and "message".
+If the input does not describe sending a message to someone, return: {"recipient": null, "message": null}
+
+Examples:
+  "send a message to Griffin saying hey what's up" -> {"recipient": "Griffin", "message": "hey what's up"}
+  "tell Sarah happy birthday" -> {"recipient": "Sarah", "message": "happy birthday"}
+  "message Alex saying the meeting is at 3" -> {"recipient": "Alex", "message": "the meeting is at 3"}
+  "what's the weather" -> {"recipient": null, "message": null}
+
+Return raw JSON only. No explanation.
+"""
+
+
+def infer_discord_intent(user_input):
+    try:
+        payload = {
+            "model": CHAT_MODEL,
+            "messages": [
+                {"role": "system", "content": DISCORD_INTENT_PROMPT},
+                {"role": "user", "content": user_input},
+            ],
+            "stream": False,
+        }
+
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        raw = r.json()["message"]["content"].strip()
+        data = json.loads(raw)
+
+        recipient = data.get("recipient")
+        message = data.get("message")
+
+        if recipient and message:
+            dbg("DISCORD_INFER", f"recipient={recipient} message={message}")
+            return recipient, message
+
+    except Exception as e:
+        dbg("DISCORD_INFER", f"Failed: {e}")
+
+    return None, None
+
+
+  
 # SPOTIFY CONTROL
   
 
@@ -639,418 +676,6 @@ def spotify_next():
     script = 'tell application "Spotify" to next track'
     subprocess.run(["osascript", "-e", script])
     return "Skipping track"
-
-
-  
-# COMMAND ROUTER
-  
-
-def command_stop_speaking():
-    if speech_process:
-        speech_process.terminate()
-    return None
-
-
-def command_send_discord_message(recipient, message):
-    return send_discord_message(recipient, message)
-
-
-def command_confirm_discord_send():
-    if not pending_discord["recipient"]:
-        return "No Discord message is waiting for confirmation."
-    return confirm_discord_send()
-
-
-def command_cancel_discord_send():
-    if not pending_discord["recipient"]:
-        return "No Discord message is waiting for cancellation."
-    return cancel_discord_send()
-
-
-def command_remember(text):
-    remember(text)
-    return "Memory stored"
-
-
-def command_forget(text):
-    forget(text)
-    return "Forgotten"
-
-
-def command_edit_memory(old, new):
-    if edit_memory(old, new):
-        return "Memory updated"
-    return "Memory not found"
-
-
-COMMANDS = {
-    "stop_speaking": {
-        "description": "Stop NOVA's current spoken response or audio playback.",
-        "args": {},
-        "function": command_stop_speaking,
-    },
-    "get_weather": {
-        "description": "Get the current weather for the configured location.",
-        "args": {},
-        "function": get_weather,
-    },
-    "get_system_status": {
-        "description": "Report CPU, memory, and disk usage.",
-        "args": {},
-        "function": get_system_status,
-    },
-    "spotify_play": {
-        "description": "Resume or play Spotify.",
-        "args": {},
-        "function": spotify_play,
-    },
-    "spotify_pause": {
-        "description": "Pause Spotify.",
-        "args": {},
-        "function": spotify_pause,
-    },
-    "spotify_next": {
-        "description": "Skip to the next Spotify track.",
-        "args": {},
-        "function": spotify_next,
-    },
-    "google_search": {
-        "description": "Search Google for a query.",
-        "args": {"query": "The search query."},
-        "function": google_search,
-    },
-    "youtube_search": {
-        "description": "Search YouTube for a query.",
-        "args": {"query": "The search query."},
-        "function": youtube_search,
-    },
-    "play_youtube_music": {
-        "description": "Search YouTube and start playing the first music/video result.",
-        "args": {
-            "query": "What to play on YouTube, like '80s music' or 'lofi beats'.",
-        },
-        "function": play_youtube_music,
-        "pre_response": "On it.",
-    },
-    "open_website": {
-        "description": "Open a website URL in the browser.",
-        "args": {"url": "The website domain or URL."},
-        "function": open_website,
-    },
-    "browser_click": {
-        "description": "Click an element on the current browser page.",
-        "args": {
-            "selector": "A CSS selector or exact visible button/link text.",
-        },
-        "function": browser_click,
-    },
-    "browser_type": {
-        "description": "Type text into an input on the current browser page.",
-        "args": {
-            "selector": "A CSS selector or input placeholder.",
-            "text": "The text to type.",
-        },
-        "function": browser_type,
-    },
-    "browser_read_page": {
-        "description": "Read the title, URL, and visible text from the current browser page.",
-        "args": {},
-        "function": browser_read_page,
-    },
-    "run_browser_agent": {
-        "description": (
-            "Use the browser agent for multi-step browser tasks like "
-            "clicking, scrolling, reading pages, navigating, or playing media."
-        ),
-        "args": {"goal": "The full browser task the user wants done."},
-        "function": run_browser_agent,
-        "pre_response": "On it.",
-    },
-    "send_discord_message": {
-        "description": "Prepare a Discord message to a recipient.",
-        "args": {
-            "recipient": "The Discord user or channel to message.",
-            "message": "The message text to send.",
-        },
-        "function": command_send_discord_message,
-    },
-    "confirm_discord_send": {
-        "description": "Confirm and send the pending Discord message.",
-        "args": {},
-        "function": command_confirm_discord_send,
-    },
-    "cancel_discord_send": {
-        "description": "Cancel the pending Discord message.",
-        "args": {},
-        "function": command_cancel_discord_send,
-    },
-    "remember": {
-        "description": "Store something in NOVA's memory for later.",
-        "args": {"text": "The memory to store."},
-        "function": command_remember,
-    },
-    "forget": {
-        "description": "Remove memories containing this text.",
-        "args": {"text": "The text to remove from memory."},
-        "function": command_forget,
-    },
-    "edit_memory": {
-        "description": "Replace an existing memory with a new memory.",
-        "args": {
-            "old": "Text to find in the existing memory.",
-            "new": "The replacement memory text.",
-        },
-        "function": command_edit_memory,
-    },
-}
-
-
-def command_specs():
-    specs = []
-    for name, command in COMMANDS.items():
-        specs.append(
-            {
-                "name": name,
-                "description": command["description"],
-                "args": command["args"],
-            }
-        )
-    return specs
-
-
-def clean_json(raw):
-    raw = raw.strip()
-    raw = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
-
-    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    if match:
-        return match.group(0)
-    return raw
-
-
-def first_url(text):
-    match = re.search(r"https?://\S+", text)
-    if match:
-        return match.group(0).rstrip(".,)")
-    return None
-
-
-def extract_music_query(text):
-    lowered = text.lower()
-    match = re.search(r"\bplay\s+(.+)", text, flags=re.IGNORECASE)
-    query = match.group(1).strip() if match else "music"
-
-    query = re.sub(
-        r"\b(on|in)\s+(youtube|youtueb|yt|a browser|the browser)\b",
-        "",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"\b(open|launch|start|a|the|browser|please|can you|could you)\b",
-        "",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(r"\s+", " ", query).strip(" .")
-
-    if not query or query == lowered:
-        query = "music"
-
-    return query
-
-
-def obvious_action_decision(user_input, decision):
-    text = user_input.lower()
-    url = first_url(user_input)
-    is_command = decision.get("type") == "command"
-
-    music_words = ["music", "song", "songs", "playlist", "video"]
-    browser_words = ["browser", "youtube", "youtueb", "yt"]
-
-    if "play" in text and any(word in text for word in music_words):
-        if any(word in text for word in browser_words) or "youtube" not in text:
-            return {
-                "type": "command",
-                "command": "play_youtube_music",
-                "args": {"query": extract_music_query(user_input)},
-            }
-
-    if url:
-        agent_words = [
-            "fill",
-            "form",
-            "click",
-            "type",
-            "submit",
-            "read",
-            "answer",
-            "complete",
-        ]
-        if any(word in text for word in agent_words):
-            return {
-                "type": "command",
-                "command": "run_browser_agent",
-                "args": {"goal": user_input},
-            }
-
-        if not is_command:
-            return {
-                "type": "command",
-                "command": "open_website",
-                "args": {"url": url},
-            }
-
-    if (
-        not is_command
-        and "open" in text
-        and any(word in text for word in browser_words)
-    ):
-        return {
-            "type": "command",
-            "command": "run_browser_agent",
-            "args": {"goal": user_input},
-        }
-
-    return decision
-
-
-def choose_command(user_input):
-    pending = pending_discord["recipient"] is not None
-    pending_note = "No Discord message is pending."
-    if pending:
-        pending_note = (
-            "A Discord message is waiting for confirmation. "
-            "Use confirm_discord_send for yes/send/confirm, and "
-            "cancel_discord_send for no/cancel/anything that rejects it."
-        )
-
-    prompt = f"""
-You are NOVA's command router.
-
-Pick exactly one of these options:
-1. Return a command call when the user wants NOVA to perform an available action.
-2. Return chat when the user is just talking, asking a general question, or no command fits.
-
-The user may make typos, speak casually, or start with words like "no" or
-"actually". Ignore that filler if an action request follows it.
-
-Available commands:
-{json.dumps(command_specs(), indent=2)}
-
-Context:
-{pending_note}
-
-Return ONLY raw JSON in one of these forms:
-{{"type": "command", "command": "command_name", "args": {{}}}}
-{{"type": "chat"}}
-
-Rules:
-- Use only command names from the available commands list.
-- Extract all required args from the user's words.
-- For run_browser_agent, pass the full user request as goal.
-- If the user asks to play music, songs, or a video on YouTube, choose
-  play_youtube_music and extract the requested style/song as query.
-- If the user asks to open a browser and play music but does not name a site,
-  choose play_youtube_music.
-- If the user asks to open a browser and play/search/watch/navigate/click/read,
-  choose run_browser_agent instead of chat.
-- If the user asks for YouTube plus playing music or a video, choose
-  play_youtube_music, even if YouTube is misspelled.
-- If the user only asks to search YouTube, choose youtube_search.
-- If the user only asks to open a specific website, choose open_website.
-- If the user asks what you can do or how commands/tools work, return chat.
-- If a required arg is missing, return chat.
-- Do not explain your choice.
-
-Examples:
-User input: hi can you open youtueb and play music
-Output: {{"type": "command", "command": "play_youtube_music", "args": {{"query": "music"}}}}
-
-User input: no open a browser and play music on youtube
-Output: {{"type": "command", "command": "play_youtube_music", "args": {{"query": "music"}}}}
-
-User input: can you open a browser and play 80s music
-Output: {{"type": "command", "command": "play_youtube_music", "args": {{"query": "80s music"}}}}
-
-User input: youtube woodworking
-Output: {{"type": "command", "command": "youtube_search", "args": {{"query": "woodworking"}}}}
-
-User input: go to https://example.com/form and fill out the form
-Output: {{"type": "command", "command": "run_browser_agent", "args": {{"goal": "go to https://example.com/form and fill out the form"}}}}
-
-User input: can you tell me why you do not use your skills?
-Output: {{"type": "chat"}}
-
-User input: {user_input}
-"""
-
-    payload = {
-        "model": CHAT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "format": "json",
-        "options": {"temperature": 0},
-        "stream": False,
-    }
-
-    try:
-        r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload)
-        raw = r.json()["message"]["content"]
-        decision = json.loads(clean_json(raw))
-        if decision.get("type") == "command":
-            if decision.get("command") not in COMMANDS:
-                return {"type": "chat"}
-        dbg("ROUTER", json.dumps(decision))
-        return decision
-    except Exception as e:
-        dbg("ROUTER", f"Failed: {e}")
-        return {"type": "chat"}
-
-
-def run_command(decision):
-    name = decision.get("command")
-    command = COMMANDS.get(name)
-
-    if not command:
-        return "I don't know how to do that yet."
-
-    args = decision.get("args") or {}
-    allowed_args = command["args"].keys()
-    clean_args = {k: v for k, v in args.items() if k in allowed_args}
-
-    missing_args = [
-        arg for arg in allowed_args
-        if arg not in clean_args or clean_args[arg] in [None, ""]
-    ]
-
-    if missing_args:
-        return "I need a little more information for that."
-
-    if command.get("pre_response"):
-        speak(command["pre_response"])
-
-    try:
-        return command["function"](**clean_args)
-    except Exception as e:
-        dbg("COMMAND", f"{name} failed: {e}")
-        return str(e)
-
-
-def handle_user_input(user_input):
-    decision = choose_command(user_input)
-    decision = obvious_action_decision(user_input, decision)
-    dbg("ROUTER_FINAL", json.dumps(decision))
-
-    if decision.get("type") == "command":
-        result = run_command(decision)
-        if result:
-            logging.info(f"NOVA: {result}")
-            speak(result)
-        return
-
-    reply = ask_ollama(user_input)
-    logging.info(f"NOVA: {reply}")
-    speak(reply)
 
 
   
@@ -1141,12 +766,12 @@ def text_loop():
 
     while True:
         try:
-            user_input = input("YOU: ").strip()
+            user_input = input("YOU: ").strip().lower()
 
             if not user_input:
                 continue
 
-            if user_input.lower() in ["exit", "quit"]:
+            if user_input in ["exit", "quit"]:
                 print("\n👋 Goodbye")
                 break
 
@@ -1170,16 +795,129 @@ if not check_ollama():
     exit(1)
 
 
+  
+# DISCORD KEYWORDS
+  
+
+DISCORD_KEYWORDS = [
+    "send a message to",
+    "send discord message",
+    "tell ",
+    "message ",
+    "discord ",
+]
+
+
+  
 # MAIN LOOP
   
 
 input_source = text_loop() if TEXT_MODE else listen_loop()
 
-try:
+while True:
     for user_input in input_source:
 
         print(f"\nYOU: {user_input}")
         logging.info(f"USER: {user_input}")
-        handle_user_input(user_input)
-except KeyboardInterrupt:
-    print("\n👋 Goodbye")
+
+        # ── STOP ──────────────────────────────
+        if "stop" in user_input:
+            if speech_process:
+                speech_process.terminate()
+            continue
+
+        # ── DISCORD CONFIRMATION ──────────────
+        if pending_discord["recipient"]:
+            if user_input.strip() in ["send", "yes", "confirm"]:
+                speak(confirm_discord_send())
+            else:
+                speak(cancel_discord_send())
+            continue
+
+        # ── WEATHER ───────────────────────────
+        if "weather" in user_input:
+            speak(get_weather())
+            continue
+
+        # ── SYSTEM STATUS ─────────────────────
+        if "system status" in user_input:
+            speak(get_system_status())
+            continue
+
+        # ── SPOTIFY ───────────────────────────
+        if "pause spotify" in user_input:
+            speak(spotify_pause())
+            continue
+
+        if "play spotify" in user_input:
+            speak(spotify_play())
+            continue
+
+        if "next song" in user_input:
+            speak(spotify_next())
+            continue
+
+        # ── GOOGLE ────────────────────────────
+        if user_input.startswith("google "):
+            query = user_input.replace("google ", "")
+            speak(google_search(query))
+            continue
+
+        # ── YOUTUBE SEARCH ────────────────────
+        if user_input.startswith("youtube "):
+            query = user_input.replace("youtube ", "")
+            speak(youtube_search(query))
+            continue
+
+        # ── WEBSITE ───────────────────────────
+        if user_input.startswith("open website "):
+            url = user_input.replace("open website ", "")
+            speak(open_website(url))
+            continue
+
+        # ── BROWSER AGENT ─────────────────────
+        if any(kw in user_input for kw in BROWSER_KEYWORDS):
+            speak("On it.")
+            result = run_browser_agent(user_input)
+            speak(result)
+            continue
+
+        # ── DISCORD ───────────────────────────
+        if any(kw in user_input for kw in DISCORD_KEYWORDS):
+            recipient, msg = infer_discord_intent(user_input)
+            if recipient and msg:
+                result = send_discord_message(recipient, msg)
+                if result:  # None means waiting for confirmation
+                    speak(result)
+            else:
+                speak("I couldn't figure out who to message or what to say.")
+            continue
+
+        # ── MEMORY ────────────────────────────
+        if user_input.startswith("remember "):
+            remember(user_input.replace("remember ", ""))
+            speak("Memory stored")
+            continue
+
+        if user_input.startswith("forget "):
+            forget(user_input.replace("forget ", ""))
+            speak("Forgotten")
+            continue
+
+        if user_input.startswith("edit memory"):
+            try:
+                parts = user_input.replace("edit memory", "").split(" to ")
+                old = parts[0].strip()
+                new = parts[1].strip()
+                if edit_memory(old, new):
+                    speak("Memory updated")
+                else:
+                    speak("Memory not found")
+            except:
+                speak("Could not edit memory")
+            continue
+
+        # ── CHAT ──────────────────────────────
+        reply = ask_ollama(user_input)
+        logging.info(f"NOVA: {reply}")
+        speak(reply)
