@@ -70,4 +70,4 @@ If you encounter any issues or have questions, please open an issue on the [GitH
 
 ---
 
-**Status:** 🚧 In Active Development DO NOT EXSPECT MUCH RN 
+**Status:** 🚧 In Active Development update offten 
