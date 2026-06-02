@@ -1,915 +1,682 @@
 #!/usr/bin/env python3
-# NOVA Voice Assistant
+# NOVA — Graphical UI
+# Run with: python ui.py
+# Requires: pip install tkinter (usually built-in)
+# Communicates with jarvis.py core via shared queue / direct import of logic
 
-import requests
+import tkinter as tk
+import threading
+import math
+import time
+import random
 import json
+import os
+import sys
+import requests
+import re
+import asyncio
 import subprocess
 import tempfile
-import os
 import queue
-import sounddevice as sd
-import base64
-import time
-import re
-import threading
-import urllib.parse
-import urllib.request
 import logging
-import pyautogui
-import psutil
-import argparse
-import vosk
 
 from datetime import datetime
-from PIL import Image
-from playwright.sync_api import sync_playwright
+
+# ---------------------------------------------------------------------------
+# Pull shared config + logic from jarvis.py without triggering its main loop.
+# We monkey-patch sys.argv so argparse inside jarvis doesn't choke, then
+# import only what we need.
+# ---------------------------------------------------------------------------
+
+_orig_argv = sys.argv
+sys.argv = [sys.argv[0]]  # strip any ui.py args before jarvis parses
+
+# Minimal stubs so jarvis.py top-level imports don't crash if vosk/sounddevice
+# aren't needed here (they're for voice, not the UI).
+import importlib, types
+
+def _stub_module(name):
+    mod = types.ModuleType(name)
+    sys.modules[name] = mod
+    return mod
+
+for _stub in ["vosk", "sounddevice", "pyautogui"]:
+    if _stub not in sys.modules:
+        _stub_module(_stub)
+
+# Give vosk stub enough surface area
+sys.modules["vosk"].Model = lambda *a, **kw: None
+sys.modules["vosk"].KaldiRecognizer = lambda *a, **kw: None
+sys.modules["sounddevice"].RawInputStream = lambda **kw: None
+
+# Now import the jarvis core (it won't start the main loop — that's guarded
+# behind the STARTUP section at module level, but since we patched argv the
+# argparse won't error and the STARTUP section still runs its print/check_ollama.
+# To avoid that we import it slightly differently below.)
+
+# Instead of importing jarvis directly (which runs startup code), we reproduce
+# only the pieces we need: config constants, handle_user_input, ask_ollama,
+# choose_command, run_command, speak, COMMANDS, etc.  We do this by exec-ing
+# the file up to but not including the STARTUP block.
+
+_JARVIS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis.py")
+
+_jarvis_src = ""
+if os.path.exists(_JARVIS_PATH):
+    with open(_JARVIS_PATH, "r") as _f:
+        _jarvis_src = _f.read()
+
+# Chop off everything from the STARTUP comment onward so we don't re-run it
+_CUT_MARKER = "# STARTUP"
+_cut_idx = _jarvis_src.find(_CUT_MARKER)
+if _cut_idx != -1:
+    _jarvis_src = _jarvis_src[:_cut_idx]
+
+_jarvis_ns = {"__name__": "__jarvis_core__", "__file__": _JARVIS_PATH}
+
+try:
+    exec(compile(_jarvis_src, _JARVIS_PATH, "exec"), _jarvis_ns)
+    _core_loaded = True
+except Exception as _e:
+    _core_loaded = False
+    print(f"[UI] Warning: could not load jarvis core: {_e}")
+
+sys.argv = _orig_argv
+
+# Pull symbols into this module's namespace
+if _core_loaded:
+    handle_user_input = _jarvis_ns.get("handle_user_input")
+    ask_ollama        = _jarvis_ns.get("ask_ollama")
+    choose_command    = _jarvis_ns.get("choose_command")
+    obvious_action_decision = _jarvis_ns.get("obvious_action_decision")
+    run_command       = _jarvis_ns.get("run_command")
+    COMMANDS          = _jarvis_ns.get("COMMANDS", {})
+    OLLAMA_URL        = _jarvis_ns.get("OLLAMA_URL", "http://localhost:11434")
+    CHAT_MODEL        = _jarvis_ns.get("CHAT_MODEL", "llama3.2:latest")
+    TTS_BACKEND       = _jarvis_ns.get("TTS_BACKEND", "edge")
+    EDGE_TTS_VOICE    = _jarvis_ns.get("EDGE_TTS_VOICE", "en-GB-RyanNeural")
+    synthesize_edge_tts = _jarvis_ns.get("synthesize_edge_tts")
+    synthesize_piper  = _jarvis_ns.get("synthesize_piper")
+    strip_sources     = _jarvis_ns.get("strip_sources", lambda t: t)
+    memory            = _jarvis_ns.get("memory", {"memories": []})
+else:
+    # Fallback stubs so the UI still opens
+    OLLAMA_URL  = "http://localhost:11434"
+    CHAT_MODEL  = "llama3.2:latest"
+    TTS_BACKEND = "edge"
+    EDGE_TTS_VOICE = "en-GB-RyanNeural"
+    COMMANDS    = {}
+    memory      = {"memories": []}
+
+    def handle_user_input(text): return "Core not loaded."
+    def ask_ollama(text): return "Core not loaded."
+    def strip_sources(t): return t
 
 
-
-# ARGUMENTS
-
-# Simple command-line arguments for debug mode and text mode (no TTS, just print responses)DO NOT REMOVE THIS I NEED IT FOR TESTING THE NEW FEATURES WITHOUT HAVING TO SPEAK THEM OUT LOUD EVERY TIME I EM GOING TO LOOS MY SANITY IF I HAVE TO KEEP SPEAKING OUT LOUD EVERY TIME I WANT TO TEST A CHANGE PLEASE JUST LET ME TYPE IT OUT INSTEAD THANK YOU
-_parser = argparse.ArgumentParser(description="NOVA Voice Assistant")
-
-_parser.add_argument(
-    "-d", "--debug",
-    action="store_true",
-    help="Enable debug output"
-)
-
-_parser.add_argument(
-    "-t", "--text",
-    action="store_true",
-    help="Run NOVA in text mode"
-)
-
-_args = _parser.parse_args()
-
-DEBUG = _args.debug
-TEXT_MODE = _args.text
-
-
-
-# DEBUG
-
-
-def dbg(tag, msg):
-    if DEBUG:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{timestamp}] [{tag}] {msg}")
-
-
-
-# CONFIG
-# need a ui to chage this stuff will do later but for now just edit the variables here
-
-OLLAMA_URL = "http://localhost:11434"
-
-CHAT_MODEL = "llama3.2:latest"
-VISION_MODEL = "llava:7b"
-
-VOICE_MODEL = os.path.expanduser(
-    "~/jarvis/voices/en_US-lessac-high.onnx"
-)
-
-VOSK_MODEL_PATH = os.path.expanduser(
-    "~/jarvis/stt/vosk-model-small-en-us-0.15"
-)
-
-MEMORY_FILE = "nova_memory.json"
-
-LOG_FILE = "nova.log"
-
-WEATHER_LOCATION = "Toronto"
-
-SAFE_MODE = True
-
-WAKE_TIMEOUT = 10
-
-WAKE_WORDS = [
-    "hey nova",
-    "nova",
-    "computer",
-    "jarvis"
-]
-
-
-  
-# LOGGING
-  
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-
-  
-# SYSTEM PROMPT
-  
-
-SYSTEM_PROMPT = """
-You are NOVA.
-
-You are a futuristic operating system assistant.
-
-Be concise.
-
-Never mention being an AI.
-
-You are speaking to Miles Allen.
-you can control the web browser, check the weather, read system status, send messages on Discord, control Spotify, and remember things for later. thes r commands are for your reference but do not mention them to the user unless they asked for help with commands:
-- To check the weather: "what's the weather" or "weather"
-- To check system status: "system status"
-- To control Spotify: "pause spotify", "play spotify", "next song"
-- To search Google: "google [search query]"
-- To search YouTube: "youtube [search query]"
-- To open a website: "open website [url]"
-"""
-
-
-  
-# MEMORY
-  
-
-memory = {"memories": []}
-
-def load_memory():
-    global memory
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r") as f:
-                memory = json.load(f)
-        except:
-            memory = {"memories": []}
-
-def save_memory():
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(memory, f, indent=2)
-
-def remember(text):
-    memory["memories"].append(text)
-    save_memory()
-
-def forget(text):
-    memory["memories"] = [
-        m for m in memory["memories"]
-        if text.lower() not in m.lower()
-    ]
-    save_memory()
-
-def edit_memory(old, new):
-    for i, m in enumerate(memory["memories"]):
-        if old.lower() in m.lower():
-            memory["memories"][i] = new
-            save_memory()
-            return True
-    return False
-
-load_memory()
-
-
-  
-# OLLAMA CHECK
-  
-#for my sanity to not see 100000000 erres and lose my mind every time I try to test a change without having ollama running which is like 90% of the time when im developing new features why do i do this to my self 
-def check_ollama():
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-        if r.status_code == 200:
-            print("🟢 Ollama online")
-            return True
-    except:
-        pass
-    print("🔴 Ollama offline")
-    return False
-
-
-  
-# SYSTEM STATUS
-  
-
-def get_system_status():
-    try:
-        cpu = psutil.cpu_percent(interval=0.5)
-        ram = psutil.virtual_memory().percent
-        disk = psutil.disk_usage("/").percent
-        return (
-            f"CPU usage is {cpu} percent. "
-            f"Memory usage is {ram} percent. "
-            f"Disk usage is {disk} percent."
-        )
-    except Exception as e:
-        return str(e)
-
-
-  
-# WEATHER
-  
-
-def get_weather():
-    try:
-        url = f"https://wttr.in/{WEATHER_LOCATION}?format=j1"
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        current = data["current_condition"][0]
-        temp = current["temp_C"]
-        desc = current["weatherDesc"][0]["value"]
-        return f"It is currently {temp} degrees Celsius with {desc}."
-    except Exception as e:
-        return str(e)
-
-
-  
-# AUDIO
-  
-
-audio_queue = queue.Queue()
-
-model_vosk = vosk.Model(VOSK_MODEL_PATH)
-
-recognizer = vosk.KaldiRecognizer(
-    model_vosk,
-    16000
-)
-
+# ---------------------------------------------------------------------------
+# UI response queue — jarvis worker thread posts results here
+# ---------------------------------------------------------------------------
+response_queue = queue.Queue()
 speech_process = None
 
-def audio_callback(indata, frames, time_info, status):
-    audio_queue.put(bytes(indata))
 
-
-  
-# CHIME
-  
-# need to replace this with a custom chime sound eventually but for now this is fine and it works so im not gonna mess with it but if i whant this on windos i need to chang it 
-def play_chime():
-    subprocess.run([
-        "afplay",
-        "/System/Library/Sounds/Hero.aiff"
-    ])
-
-
-  
-# TTS
-  
-
-def speak(text):
-    global speech_process
-
-    print(f"\nNOVA: {text}\n")
-
-    if TEXT_MODE:
-        return
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav_path = f.name
-
-    subprocess.run(
-        [
-            "piper",
-            "--model",
-            VOICE_MODEL,
-            "--output_file",
-            wav_path,
-        ],
-        input=text.encode(),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    speech_process = subprocess.Popen([
-        "ffplay",
-        "-nodisp",
-        "-autoexit",
-        "-loglevel",
-        "quiet",
-        wav_path,
-    ])
-
-    speech_process.wait()
-
+def ollama_online():
     try:
-        os.remove(wav_path)
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        return r.status_code == 200
     except:
-        pass
+        return False
 
 
-  
-# BROWSER — INIT
-  
+def speak_text(text):
+    global speech_process
+    spoken = strip_sources(text)
+    if not spoken:
+        spoken = text
 
-playwright_instance = None
-browser = None
-page = None
-
-def init_browser():
-    global playwright_instance, browser, page
-
-    if browser:
-        return
-
-    playwright_instance = sync_playwright().start()
-    browser = playwright_instance.chromium.launch(headless=False)
-    page = browser.new_page()
-    print("🌐 Browser ready")
-
-
-  
-# BROWSER — BASIC HELPERS
-  
-
-def open_website(url):
+    suffix = ".mp3" if TTS_BACKEND == "edge" else ".wav"
     try:
-        init_browser()
-        if not url.startswith("http"):
-            url = "https://" + url
-        page.goto(url, wait_until="domcontentloaded")
-        return f"Opened {url}"
-    except Exception as e:
-        return str(e)
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            audio_path = f.name
 
-def google_search(query):
-    try:
-        init_browser()
-        encoded = urllib.parse.quote_plus(query)
-        page.goto(
-            f"https://www.google.com/search?q={encoded}",
-            wait_until="domcontentloaded"
+        if TTS_BACKEND == "edge" and synthesize_edge_tts:
+            asyncio.run(synthesize_edge_tts(spoken, audio_path))
+        elif synthesize_piper:
+            synthesize_piper(spoken, audio_path)
+        else:
+            return
+
+        speech_process = subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", audio_path]
         )
-        return f"Searching Google for {query}"
-    except Exception as e:
-        return str(e)
-
-def youtube_search(query):
-    try:
-        init_browser()
-        encoded = urllib.parse.quote_plus(query)
-        page.goto(
-            f"https://www.youtube.com/results?search_query={encoded}",
-            wait_until="domcontentloaded"
-        )
-        return f"Searching YouTube for {query}"
-    except Exception as e:
-        return str(e)
-
-def browser_click(selector):
-    try:
-        init_browser()
+        speech_process.wait()
         try:
-            page.click(selector, timeout=5000)
+            os.remove(audio_path)
         except:
-            page.get_by_text(selector).first.click()
-        return f"Clicked '{selector}'"
+            pass
     except Exception as e:
-        return str(e)
+        print(f"[UI TTS] {e}")
 
-def browser_type(selector, text):
+
+def process_input_threaded(text, on_start, on_done):
+    """Run in a thread. Calls on_start(), processes, posts to queue, calls on_done()."""
+    on_start()
+
+    result_text = ""
     try:
-        init_browser()
-        try:
-            page.fill(selector, text)
-        except:
-            page.get_by_placeholder(selector).fill(text)
-        return f"Typed into '{selector}'"
-    except Exception as e:
-        return str(e)
-
-def browser_read_page():
-    try:
-        init_browser()
-        title = page.title()
-        url = page.url
-        content = page.evaluate("""() => {
-            const clone = document.body.cloneNode(true);
-            clone.querySelectorAll('script, style, noscript, svg').forEach(el => el.remove());
-            return clone.innerText.replace(/\\s+/g, ' ').trim().slice(0, 3000);
-        }""")
-        return f"Page: {title} ({url})\n\n{content}"
-    except Exception as e:
-        return str(e)
-
-
-  
-# BROWSER — AGENTIC LOOP
-  
-
-def run_browser_agent(goal):
-    """
-    Multi-step browser agent. The LLM decides actions one at a time
-    until it returns 'done' or max_steps is reached.
-    Handles goals like 'go to YouTube and play lofi music'.
-    """
-    try:
-        init_browser()
-        max_steps = 10
-        step = 0
-
-        while step < max_steps:
-            step += 1
-
-            current_url = page.url if page else "about:blank"
-            current_title = page.title() if page else ""
-
-            # Grab a brief snapshot of visible text for context
-            try:
-                snapshot = page.evaluate("""() => {
-                    const clone = document.body.cloneNode(true);
-                    clone.querySelectorAll('script,style,noscript,svg').forEach(el => el.remove());
-                    return clone.innerText.replace(/\\s+/g, ' ').trim().slice(0, 1500);
-                }""")
-            except:
-                snapshot = ""
-
-            prompt = f"""You are controlling a real web browser to accomplish this goal: "{goal}"
-
-Current page: "{current_title}" at {current_url}
-Visible page text (first 1500 chars):
-{snapshot}
-
-Decide the single best next action. Respond ONLY with one JSON object from the options below:
-  {{"action": "navigate", "url": "https://..."}}
-  {{"action": "click", "selector": "CSS selector or exact visible button/link text"}}
-  {{"action": "type", "selector": "CSS selector or placeholder text", "text": "text to type"}}
-  {{"action": "press", "key": "Enter"}}
-  {{"action": "scroll", "direction": "down"}}
-  {{"action": "wait", "seconds": 2}}
-  {{"action": "done", "summary": "brief description of what was accomplished"}}
-
-Tips:
-- On YouTube, click the video title text to play it (e.g. the first search result title).
-- After navigating to a new page, issue a wait action to let it load before interacting.
-- If a cookie/consent banner appears, click the accept or dismiss button first.
-- When the goal is fully complete, return done.
-
-Return raw JSON only. No explanation. No markdown fences."""
-
+        if _core_loaded and choose_command and obvious_action_decision and run_command and ask_ollama:
+            decision = choose_command(text)
+            decision = obvious_action_decision(text, decision)
+            if decision.get("type") == "command":
+                result_text = run_command(decision) or ""
+            else:
+                result_text = ask_ollama(text)
+        else:
+            # Minimal fallback: raw Ollama chat
             payload = {
                 "model": CHAT_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": text}],
                 "stream": False,
             }
-
-            r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload)
-            raw = r.json()["message"]["content"].strip()
-
-            # Strip markdown fences if the model wraps the JSON
-            raw = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
-
-            dbg("AGENT", f"Step {step}: {raw}")
-
-            try:
-                action = json.loads(raw)
-            except json.JSONDecodeError:
-                dbg("AGENT", f"Bad JSON on step {step}, skipping")
-                continue
-
-            a = action.get("action")
-
-            if a == "navigate":
-                url = action.get("url", "")
-                if not url.startswith("http"):
-                    url = "https://" + url
-                page.goto(url, wait_until="domcontentloaded")
-
-            elif a == "click":
-                sel = action.get("selector", "")
-                try:
-                    page.click(sel, timeout=5000)
-                except:
-                    try:
-                        page.get_by_text(sel).first.click()
-                    except Exception as e:
-                        dbg("AGENT", f"Click failed: {e}")
-
-            elif a == "type":
-                sel = action.get("selector", "")
-                text = action.get("text", "")
-                try:
-                    page.fill(sel, text)
-                except:
-                    try:
-                        page.get_by_placeholder(sel).fill(text)
-                    except Exception as e:
-                        dbg("AGENT", f"Type failed: {e}")
-
-            elif a == "press":
-                page.keyboard.press(action.get("key", "Enter"))
-
-            elif a == "scroll":
-                direction = action.get("direction", "down")
-                page.keyboard.press(
-                    "PageDown" if direction == "down" else "PageUp"
-                )
-
-            elif a == "wait":
-                secs = min(action.get("seconds", 2), 5)  # cap at 5s
-                time.sleep(secs)
-
-            elif a == "done":
-                return action.get("summary", "Done.")
-
-            else:
-                return f"Unknown action: {a}"
-
-            # Small pause between steps so pages can settle
-            time.sleep(1)
-
-        return "Reached the maximum number of steps."
-
+            r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=30)
+            result_text = r.json()["message"]["content"]
     except Exception as e:
-        dbg("AGENT", f"run_browser_agent failed: {e}")
-        return str(e)
+        result_text = f"Error: {e}"
+
+    result_text = result_text or "…"
+    response_queue.put(result_text)
+    on_done(result_text)
+
+    # Speak in the same thread (non-blocking for UI since we're already threaded)
+    speak_text(result_text)
 
 
-  
-# BROWSER — INTENT KEYWORDS
-  
+# ---------------------------------------------------------------------------
+# NOVA UI
+# ---------------------------------------------------------------------------
 
-BROWSER_KEYWORDS = [
-    "in the browser",
-    "on the page",
-    "click ",
-    "scroll ",
-    "fill in",
-    "type into",
-    "read the page",
-    "what does the page say",
-    "what's on the page",
-    "go to ",
-    "navigate to ",
-    "open the browser",
-    "open youtube",
-    "open google",
-    "play ",
-    "search for ",
-    "find on youtube",
-    "watch ",
-    "browse ",
-]
+class NovaUI:
+    # ---- Palette -----------------------------------------------------------
+    BG          = "#050A0F"
+    PANEL       = "#080E14"
+    ACCENT      = "#00CFFF"
+    ACCENT2     = "#0066FF"
+    ACCENT_DIM  = "#004466"
+    TEXT        = "#C8E8F0"
+    TEXT_DIM    = "#3A6070"
+    DANGER      = "#FF3355"
+    SUCCESS     = "#00FF99"
+    RING_IDLE   = "#0A2030"
+    RING_ACTIVE = "#00CFFF"
 
+    def __init__(self, root):
+        self.root = root
+        self.root.title("NOVA")
+        self.root.configure(bg=self.BG)
+        self.root.geometry("900x700")
+        self.root.minsize(700, 560)
 
-  
-# DISCORD AUTOMATION
-  
+        self._state   = "idle"   # idle | listening | thinking | speaking
+        self._tick    = 0
+        self._history = []       # list of (role, text)
+        self._anim_id = None
+        self._wave_offsets = [random.uniform(0, math.pi * 2) for _ in range(64)]
 
-def open_discord():
-    subprocess.Popen(["open", "-a", "Discord"])
+        self._build_layout()
+        self._set_state("idle")
+        self._animate()
+        self._poll_queue()
 
-# Holds a pending discord message waiting for confirmation
-pending_discord = {"recipient": None, "message": None}
+        # Status check
+        self.root.after(200, self._startup_check)
 
-def send_discord_message(user, message):
-    try:
-        open_discord()
-        time.sleep(3)
-        pyautogui.hotkey("command", "k")
-        time.sleep(1)
-        pyautogui.write(user)
-        pyautogui.press("enter")
-        time.sleep(1)
-        pyautogui.write(message)
+    # -----------------------------------------------------------------------
+    # Layout
+    # -----------------------------------------------------------------------
+    def _build_layout(self):
+        # Top bar
+        top = tk.Frame(self.root, bg=self.BG, height=48)
+        top.pack(fill="x", padx=0, pady=0)
+        top.pack_propagate(False)
 
-        if SAFE_MODE:
-            speak(
-                f"Message to {user} ready. Say send to confirm or cancel to abort."
-            )
-            pending_discord["recipient"] = user
-            pending_discord["message"] = message
-            return None  # Signal: waiting for confirmation
+        self._status_dot = tk.Canvas(top, width=12, height=12, bg=self.BG,
+                                     highlightthickness=0)
+        self._status_dot.pack(side="left", padx=(20, 6), pady=16)
+        self._dot_oval = self._status_dot.create_oval(2, 2, 10, 10,
+                                                       fill=self.TEXT_DIM,
+                                                       outline="")
 
-        pyautogui.press("enter")
-        return f"Message sent to {user}"
+        tk.Label(top, text="N O V A", font=("Courier", 13, "bold"),
+                 fg=self.ACCENT, bg=self.BG).pack(side="left")
 
-    except Exception as e:
-        return str(e)
+        self._state_label = tk.Label(top, text="OFFLINE",
+                                     font=("Courier", 9),
+                                     fg=self.TEXT_DIM, bg=self.BG)
+        self._state_label.pack(side="right", padx=20)
 
-def confirm_discord_send():
-    pending_discord["recipient"] = None
-    pending_discord["message"] = None
-    pyautogui.press("enter")
-    return "Message sent."
+        self._time_label = tk.Label(top, text="",
+                                    font=("Courier", 9),
+                                    fg=self.TEXT_DIM, bg=self.BG)
+        self._time_label.pack(side="right", padx=10)
+        self._tick_clock()
 
-def cancel_discord_send():
-    pending_discord["recipient"] = None
-    pending_discord["message"] = None
-    pyautogui.press("escape")
-    return "Message cancelled."
+        # Divider
+        tk.Frame(self.root, bg=self.ACCENT_DIM, height=1).pack(fill="x")
 
+        # Main area: sphere left, chat right
+        main = tk.Frame(self.root, bg=self.BG)
+        main.pack(fill="both", expand=True, padx=0, pady=0)
 
-  
-# DISCORD — INTENT INFERENCE
-  
+        # Left panel — sphere
+        left = tk.Frame(main, bg=self.BG, width=300)
+        left.pack(side="left", fill="y", padx=0)
+        left.pack_propagate(False)
 
-DISCORD_INTENT_PROMPT = """
-Extract a Discord message intent from the user input.
-Return ONLY a JSON object with keys "recipient" and "message".
-If the input does not describe sending a message to someone, return: {"recipient": null, "message": null}
+        self._sphere_canvas = tk.Canvas(left, width=300, height=300,
+                                         bg=self.BG, highlightthickness=0)
+        self._sphere_canvas.pack(pady=(30, 0))
 
-Examples:
-  "send a message to Griffin saying hey what's up" -> {"recipient": "Griffin", "message": "hey what's up"}
-  "tell Sarah happy birthday" -> {"recipient": "Sarah", "message": "happy birthday"}
-  "message Alex saying the meeting is at 3" -> {"recipient": "Alex", "message": "the meeting is at 3"}
-  "what's the weather" -> {"recipient": null, "message": null}
+        self._nova_label = tk.Label(left, text="NOVA",
+                                    font=("Courier", 11, "bold"),
+                                    fg=self.ACCENT, bg=self.BG)
+        self._nova_label.pack(pady=(8, 0))
 
-Return raw JSON only. No explanation.
-"""
+        self._mode_label = tk.Label(left, text="STANDBY",
+                                    font=("Courier", 8),
+                                    fg=self.TEXT_DIM, bg=self.BG)
+        self._mode_label.pack()
 
-def infer_discord_intent(user_input):
-    try:
-        payload = {
-            "model": CHAT_MODEL,
-            "messages": [
-                {"role": "system", "content": DISCORD_INTENT_PROMPT},
-                {"role": "user", "content": user_input}
-            ],
-            "stream": False,
-        }
+        # Memory count
+        self._mem_label = tk.Label(left, text="MEM: 0",
+                                   font=("Courier", 8),
+                                   fg=self.TEXT_DIM, bg=self.BG)
+        self._mem_label.pack(pady=(20, 0))
 
-        r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload)
-        raw = r.json()["message"]["content"].strip()
-        data = json.loads(raw)
+        # Right panel — chat + input
+        right = tk.Frame(main, bg=self.BG)
+        right.pack(side="left", fill="both", expand=True, padx=(0, 0))
 
-        recipient = data.get("recipient")
-        message = data.get("message")
+        # Vertical separator
+        tk.Frame(main, bg=self.ACCENT_DIM, width=1).place(x=300, y=0,
+                                                            relheight=1)
 
-        if recipient and message:
-            dbg("DISCORD_INFER", f"recipient={recipient} message={message}")
-            return recipient, message
+        # Chat scroll area
+        chat_outer = tk.Frame(right, bg=self.BG)
+        chat_outer.pack(fill="both", expand=True, padx=12, pady=(12, 0))
 
-    except Exception as e:
-        dbg("DISCORD_INFER", f"Failed: {e}")
+        scrollbar = tk.Scrollbar(chat_outer, bg=self.BG,
+                                  troughcolor=self.BG,
+                                  activebackground=self.ACCENT_DIM,
+                                  highlightthickness=0)
+        scrollbar.pack(side="right", fill="y")
 
-    return None, None
-
-
-  
-# SPOTIFY CONTROL
-  
-
-def spotify_play():
-    script = 'tell application "Spotify" to play'
-    subprocess.run(["osascript", "-e", script])
-    return "Spotify resumed"
-
-def spotify_pause():
-    script = 'tell application "Spotify" to pause'
-    subprocess.run(["osascript", "-e", script])
-    return "Spotify paused"
-
-def spotify_next():
-    script = 'tell application "Spotify" to next track'
-    subprocess.run(["osascript", "-e", script])
-    return "Skipping track"
-
-
-  
-# CHAT
-  
-
-messages = [
-    {
-        "role": "system",
-        "content": SYSTEM_PROMPT
-    }
-]
-
-def ask_ollama(user_input):
-    # Inject current memories into context if any exist
-    if memory["memories"]:
-        mem_block = "Memories:\n" + "\n".join(
-            f"- {m}" for m in memory["memories"]
+        self._chat_box = tk.Text(
+            chat_outer,
+            bg=self.PANEL,
+            fg=self.TEXT,
+            font=("Courier", 10),
+            wrap="word",
+            relief="flat",
+            bd=0,
+            padx=12, pady=10,
+            state="disabled",
+            yscrollcommand=scrollbar.set,
+            selectbackground=self.ACCENT_DIM,
+            insertbackground=self.ACCENT,
+            highlightthickness=1,
+            highlightbackground=self.ACCENT_DIM,
         )
-        full_input = f"{mem_block}\n\n{user_input}"
-    else:
-        full_input = user_input
+        self._chat_box.pack(fill="both", expand=True)
+        scrollbar.config(command=self._chat_box.yview)
 
-    messages.append({"role": "user", "content": full_input})
+        # Tags
+        self._chat_box.tag_config("you",  foreground=self.ACCENT,
+                                   font=("Courier", 10, "bold"))
+        self._chat_box.tag_config("nova", foreground=self.SUCCESS,
+                                   font=("Courier", 10, "bold"))
+        self._chat_box.tag_config("you_text",  foreground=self.TEXT)
+        self._chat_box.tag_config("nova_text", foreground=self.TEXT)
+        self._chat_box.tag_config("sys",  foreground=self.TEXT_DIM,
+                                   font=("Courier", 9, "italic"))
+        self._chat_box.tag_config("err",  foreground=self.DANGER)
 
-    payload = {
-        "model": CHAT_MODEL,
-        "messages": messages,
-        "stream": False,
-    }
+        # Input row
+        input_row = tk.Frame(right, bg=self.BG)
+        input_row.pack(fill="x", padx=12, pady=10)
 
-    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload)
-    reply = r.json()["message"]["content"]
+        self._input = tk.Entry(
+            input_row,
+            bg=self.PANEL,
+            fg=self.TEXT,
+            font=("Courier", 11),
+            relief="flat",
+            bd=0,
+            insertbackground=self.ACCENT,
+            highlightthickness=1,
+            highlightbackground=self.ACCENT_DIM,
+            highlightcolor=self.ACCENT,
+        )
+        self._input.pack(side="left", fill="x", expand=True,
+                          ipady=8, padx=(0, 8))
+        self._input.bind("<Return>", self._on_submit)
+        self._input.bind("<FocusIn>",
+                          lambda e: self._input.config(
+                              highlightbackground=self.ACCENT))
+        self._input.bind("<FocusOut>",
+                          lambda e: self._input.config(
+                              highlightbackground=self.ACCENT_DIM))
 
-    messages.append({"role": "assistant", "content": reply})
+        self._send_btn = tk.Button(
+            input_row,
+            text="SEND",
+            font=("Courier", 10, "bold"),
+            bg=self.ACCENT2,
+            fg="#000000",
+            activebackground=self.ACCENT,
+            activeforeground="#000000",
+            relief="flat",
+            bd=0,
+            padx=16, pady=8,
+            cursor="hand2",
+            command=self._on_submit,
+        )
+        self._send_btn.pack(side="left")
 
-    return reply
+        # Bottom bar
+        tk.Frame(self.root, bg=self.ACCENT_DIM, height=1).pack(fill="x")
+        bottom = tk.Frame(self.root, bg=self.BG, height=28)
+        bottom.pack(fill="x")
+        bottom.pack_propagate(False)
+        self._bottom_label = tk.Label(
+            bottom, text="NOVA INTERFACE v1.0",
+            font=("Courier", 8), fg=self.TEXT_DIM, bg=self.BG)
+        self._bottom_label.pack(side="left", padx=20, pady=6)
 
+    # -----------------------------------------------------------------------
+    # State machine
+    # -----------------------------------------------------------------------
+    def _set_state(self, state):
+        self._state = state
+        labels = {
+            "idle":      ("STANDBY",  self.TEXT_DIM, self.TEXT_DIM),
+            "listening": ("LISTENING", self.ACCENT,   self.ACCENT),
+            "thinking":  ("THINKING",  self.ACCENT2,  self.ACCENT2),
+            "speaking":  ("SPEAKING",  self.SUCCESS,  self.SUCCESS),
+        }
+        mode_text, mode_color, dot_color = labels.get(
+            state, ("STANDBY", self.TEXT_DIM, self.TEXT_DIM))
 
-  
-# VOICE LOOP
-  
+        self._mode_label.config(text=mode_text, fg=mode_color)
+        self._state_label.config(text=mode_text)
+        self._status_dot.itemconfig(self._dot_oval, fill=dot_color)
 
-def listen_loop():
-    print("\n🟢 Say wake word...")
+    # -----------------------------------------------------------------------
+    # Sphere animation
+    # -----------------------------------------------------------------------
+    def _animate(self):
+        self._tick += 1
+        self._draw_sphere()
+        self._anim_id = self.root.after(30, self._animate)
 
-    with sd.RawInputStream(
-        samplerate=16000,
-        blocksize=4000,
-        dtype="int16",
-        channels=1,
-        callback=audio_callback,
-    ):
-        active = False
-        wake_time = 0
+    def _draw_sphere(self):
+        c = self._sphere_canvas
+        c.delete("all")
 
-        while True:
-            data = audio_queue.get()
+        cx, cy, R = 150, 150, 90
+        t = self._tick * 0.04
 
-            if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
-                text = result.get("text", "").lower().strip()
+        state = self._state
 
-                if not text:
-                    continue
+        # Background glow
+        if state in ("speaking", "listening"):
+            glow_r = R + 28 + 8 * math.sin(t * 2)
+            for i in range(5):
+                alpha = int(30 - i * 5)
+                gr = glow_r + i * 7
+                col = self._lerp_color("#003050", self.BG, i / 5)
+                c.create_oval(cx - gr, cy - gr, cx + gr, cy + gr,
+                              outline=col, width=1)
 
-                if active and (time.time() - wake_time > WAKE_TIMEOUT):
-                    active = False
-                    print("⏳ Wake timeout")
-
-                if not active:
-                    if any(w in text for w in WAKE_WORDS):
-                        print("🟢 Wake word detected")
-                        play_chime()
-                        active = True
-                        wake_time = time.time()
-                    continue
-
-                yield text
-                active = False
-
-
-  
-# TEXT LOOP
-  
-
-def text_loop():
-    print("\n💬 TEXT MODE ENABLED")
-    print("Type 'exit' to quit.\n")
-
-    while True:
-        try:
-            user_input = input("YOU: ").strip().lower()
-
-            if not user_input:
+        # Draw latitude arcs (horizontal rings)
+        n_rings = 7
+        for i in range(n_rings):
+            lat = -1 + 2 * i / (n_rings - 1)  # -1 to 1
+            y_pos = cy + lat * R
+            r_ring = R * math.sqrt(max(0, 1 - lat * lat))
+            if r_ring < 2:
                 continue
 
-            if user_input in ["exit", "quit"]:
-                print("\n👋 Goodbye")
-                break
-
-            yield user_input
-
-        except KeyboardInterrupt:
-            print("\n👋 Goodbye")
-            break
-
-
-  
-# STARTUP
-  
-
-print("\nNOVA ONLINE")
-
-if TEXT_MODE:
-    print("⌨️  Running in TEXT MODE (-t)")
-
-if not check_ollama():
-    exit(1)
-
-
-  
-# DISCORD KEYWORDS
-  
-
-DISCORD_KEYWORDS = [
-    "send a message to",
-    "send discord message",
-    "tell ",
-    "message ",
-    "discord ",
-]
-
-
-  
-# MAIN LOOP
-  
-
-input_source = (
-    text_loop()
-    if TEXT_MODE
-    else listen_loop()
-)
-
-while True:
-    for user_input in input_source:
-
-        print(f"\nYOU: {user_input}")
-        logging.info(f"USER: {user_input}")
-
-        # ── STOP ──────────────────────────────
-        if "stop" in user_input:
-            if speech_process:
-                speech_process.terminate()
-            continue
-
-        # ── DISCORD CONFIRMATION ──────────────
-        if pending_discord["recipient"]:
-            if user_input.strip() in ["send", "yes", "confirm"]:
-                speak(confirm_discord_send())
+            phase = t + i * 0.3
+            if state == "thinking":
+                squish = 0.85 + 0.15 * math.sin(phase * 1.7 + i)
+            elif state in ("speaking", "listening"):
+                squish = 0.7 + 0.3 * abs(math.sin(phase * 3 + i * 0.5))
             else:
-                speak(cancel_discord_send())
-            continue
+                squish = 0.88 + 0.12 * math.sin(phase)
 
-        # ── WEATHER ───────────────────────────
-        if "weather" in user_input:
-            speak(get_weather())
-            continue
+            rx = r_ring
+            ry = r_ring * squish * 0.38
 
-        # ── SYSTEM STATUS ─────────────────────
-        if "system status" in user_input:
-            speak(get_system_status())
-            continue
+            dist_from_eq = abs(lat)
+            brightness = 1.0 - dist_from_eq * 0.6
+            if state == "speaking":
+                brightness *= 0.7 + 0.3 * abs(math.sin(t * 4 + i))
+            elif state == "thinking":
+                brightness *= 0.6 + 0.4 * math.sin(t * 2 + i * 0.8)
 
-        # ── SPOTIFY ───────────────────────────
-        if "pause spotify" in user_input:
-            speak(spotify_pause())
-            continue
+            col = self._ring_color(brightness, state)
+            lw = 1 + brightness * 1.5
 
-        if "play spotify" in user_input:
-            speak(spotify_play())
-            continue
+            c.create_oval(cx - rx, y_pos - ry,
+                          cx + rx, y_pos + ry,
+                          outline=col, width=lw)
 
-        if "next song" in user_input:
-            speak(spotify_next())
-            continue
+        # Draw longitude arcs (vertical)
+        n_long = 8
+        for i in range(n_long):
+            angle = math.pi * i / n_long + t * 0.15
+            points = []
+            steps = 40
+            for s in range(steps + 1):
+                phi = math.pi * s / steps
+                x3 = R * math.sin(phi) * math.cos(angle)
+                y3 = -R * math.cos(phi)
+                # Only draw front-facing part
+                if math.cos(angle) >= -0.1 or True:
+                    px = cx + x3
+                    py = cy + y3
+                    points.append((px, py))
 
-        # ── GOOGLE ────────────────────────────
-        if user_input.startswith("google "):
-            query = user_input.replace("google ", "")
-            speak(google_search(query))
-            continue
+            if len(points) > 2:
+                dist = abs(math.cos(angle))
+                brightness = 0.2 + 0.5 * dist
+                if state == "speaking":
+                    brightness += 0.3 * abs(math.sin(t * 3 + i))
+                col = self._ring_color(brightness * 0.7, state)
+                flat = [coord for pt in points for coord in pt]
+                if len(flat) >= 4:
+                    c.create_line(*flat, fill=col, width=1, smooth=True)
 
-        # ── YOUTUBE SEARCH ────────────────────
-        if user_input.startswith("youtube "):
-            query = user_input.replace("youtube ", "")
-            speak(youtube_search(query))
-            continue
-
-        # ── WEBSITE ───────────────────────────
-        if user_input.startswith("open website "):
-            url = user_input.replace("open website ", "")
-            speak(open_website(url))
-            continue
-
-        # ── BROWSER AGENT ─────────────────────
-        if any(kw in user_input for kw in BROWSER_KEYWORDS):
-            speak("On it.")
-            result = run_browser_agent(user_input)
-            speak(result)
-            continue
-
-        # ── DISCORD ───────────────────────────
-        if any(kw in user_input for kw in DISCORD_KEYWORDS):
-            recipient, msg = infer_discord_intent(user_input)
-            if recipient and msg:
-                result = send_discord_message(recipient, msg)
-                if result:  # None means waiting for confirmation
-                    speak(result)
+        # Core sphere fill (gradient simulation via concentric ovals)
+        for i in range(12, 0, -1):
+            frac = i / 12
+            r2 = R * frac * 0.95
+            if state == "speaking":
+                col = self._lerp_color("#001520", "#003040", 1 - frac)
+            elif state == "thinking":
+                col = self._lerp_color("#001020", "#002535", 1 - frac)
+            elif state == "listening":
+                col = self._lerp_color("#001828", "#002840", 1 - frac)
             else:
-                speak("I couldn't figure out who to message or what to say.")
-            continue
+                col = self._lerp_color("#000810", "#001520", 1 - frac)
+            c.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
+                          fill=col, outline="")
 
-        # ── MEMORY ────────────────────────────
-        if user_input.startswith("remember "):
-            remember(user_input.replace("remember ", ""))
-            speak("Memory stored")
-            continue
+        # Redraw rings on top (front half)
+        for i in range(n_rings):
+            lat = -1 + 2 * i / (n_rings - 1)
+            y_pos = cy + lat * R
+            r_ring = R * math.sqrt(max(0, 1 - lat * lat))
+            if r_ring < 2:
+                continue
+            phase = t + i * 0.3
+            if state == "thinking":
+                squish = 0.85 + 0.15 * math.sin(phase * 1.7 + i)
+            elif state in ("speaking", "listening"):
+                squish = 0.7 + 0.3 * abs(math.sin(phase * 3 + i * 0.5))
+            else:
+                squish = 0.88 + 0.12 * math.sin(phase)
+            rx = r_ring
+            ry = r_ring * squish * 0.38
+            dist_from_eq = abs(lat)
+            brightness = 1.0 - dist_from_eq * 0.6
+            if state == "speaking":
+                brightness *= 0.7 + 0.3 * abs(math.sin(t * 4 + i))
+            col = self._ring_color(brightness, state)
+            lw = 1 + brightness * 1.5
+            c.create_arc(cx - rx, y_pos - ry, cx + rx, y_pos + ry,
+                         start=0, extent=180,
+                         outline=col, width=lw, style="arc")
 
-        if user_input.startswith("forget "):
-            forget(user_input.replace("forget ", ""))
-            speak("Forgotten")
-            continue
+        # Specular highlight
+        hx, hy, hr = cx - R * 0.28, cy - R * 0.28, R * 0.18
+        c.create_oval(hx - hr, hy - hr * 0.6,
+                      hx + hr, hy + hr * 0.6,
+                      fill="#0A3040", outline="")
 
-        if user_input.startswith("edit memory"):
-            try:
-                parts = user_input.replace("edit memory", "").split(" to ")
-                old = parts[0].strip()
-                new = parts[1].strip()
-                if edit_memory(old, new):
-                    speak("Memory updated")
-                else:
-                    speak("Memory not found")
-            except:
-                speak("Could not edit memory")
-            continue
+        # Outer ring
+        ring_col = self.RING_ACTIVE if state != "idle" else self.RING_IDLE
+        lw = 2 if state != "idle" else 1
+        if state == "speaking":
+            pulse = R + 4 + 3 * math.sin(t * 5)
+        else:
+            pulse = R + 4
+        c.create_oval(cx - pulse, cy - pulse, cx + pulse, cy + pulse,
+                      outline=ring_col, width=lw)
 
-        # ── CHAT ──────────────────────────────
-        reply = ask_ollama(user_input)
-        logging.info(f"NOVA: {reply}")
-        speak(reply)
+        # Update memory label
+        mem_count = len(memory.get("memories", []))
+        self._mem_label.config(
+            text=f"MEM: {mem_count}  |  {datetime.now().strftime('%H:%M')}",
+            fg=self.TEXT_DIM)
+
+    def _ring_color(self, brightness, state):
+        if state == "speaking":
+            base = (0, 255, 153)
+        elif state == "thinking":
+            base = (0, 102, 255)
+        elif state == "listening":
+            base = (0, 207, 255)
+        else:
+            base = (0, 100, 140)
+        r = int(base[0] * brightness)
+        g = int(base[1] * brightness)
+        b = int(base[2] * brightness)
+        r = max(0, min(255, r))
+        g = max(0, min(255, g))
+        b = max(0, min(255, b))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    @staticmethod
+    def _lerp_color(c1, c2, t):
+        def parse(c):
+            c = c.lstrip("#")
+            return tuple(int(c[i:i+2], 16) for i in (0, 2, 4))
+        r1, g1, b1 = parse(c1)
+        r2, g2, b2 = parse(c2)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    # -----------------------------------------------------------------------
+    # Clock
+    # -----------------------------------------------------------------------
+    def _tick_clock(self):
+        self._time_label.config(text=datetime.now().strftime("%H:%M:%S"))
+        self.root.after(1000, self._tick_clock)
+
+    # -----------------------------------------------------------------------
+    # Startup check
+    # -----------------------------------------------------------------------
+    def _startup_check(self):
+        if ollama_online():
+            self._append_chat("sys", "NOVA online. Ollama connected.\n")
+            self._set_state("idle")
+            self._status_dot.itemconfig(self._dot_oval, fill=self.SUCCESS)
+        else:
+            self._append_chat("err",
+                "⚠  Ollama is offline. Start Ollama and restart.\n")
+            self._set_state("idle")
+
+    # -----------------------------------------------------------------------
+    # Chat log helpers
+    # -----------------------------------------------------------------------
+    def _append_chat(self, kind, text):
+        self._chat_box.config(state="normal")
+        if kind == "you":
+            self._chat_box.insert("end", "YOU  ", "you")
+            self._chat_box.insert("end", text + "\n", "you_text")
+        elif kind == "nova":
+            self._chat_box.insert("end", "NOVA ", "nova")
+            self._chat_box.insert("end", text + "\n", "nova_text")
+        elif kind == "err":
+            self._chat_box.insert("end", text + "\n", "err")
+        else:
+            self._chat_box.insert("end", text, "sys")
+        self._chat_box.config(state="disabled")
+        self._chat_box.see("end")
+
+    # -----------------------------------------------------------------------
+    # Input handling
+    # -----------------------------------------------------------------------
+    def _on_submit(self, event=None):
+        text = self._input.get().strip()
+        if not text:
+            return
+        if self._state in ("thinking", "speaking"):
+            return  # busy
+
+        self._input.delete(0, "end")
+        self._append_chat("you", text)
+        self._set_state("thinking")
+        self._send_btn.config(state="disabled")
+
+        t = threading.Thread(
+            target=process_input_threaded,
+            args=(
+                text,
+                lambda: None,
+                lambda result: self.root.after(0, self._on_response_ready),
+            ),
+            daemon=True,
+        )
+        t.start()
+
+    def _on_response_ready(self):
+        # The actual text comes via response_queue
+        pass
+
+    # -----------------------------------------------------------------------
+    # Queue polling — picks up results from the worker thread
+    # -----------------------------------------------------------------------
+    def _poll_queue(self):
+        try:
+            result = response_queue.get_nowait()
+            self._append_chat("nova", result)
+            self._set_state("speaking")
+            self._send_btn.config(state="normal")
+            # After a couple seconds flip back to idle
+            self.root.after(2500, lambda: self._set_state("idle"))
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queue)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = NovaUI(root)
+    root.mainloop()

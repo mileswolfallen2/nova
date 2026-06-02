@@ -21,6 +21,7 @@ import psutil
 import argparse
 import vosk
 
+from ddgs import DDGS
 from datetime import datetime
 from PIL import Image
 from playwright.sync_api import sync_playwright
@@ -110,6 +111,8 @@ Never claim you performed an action unless a command actually did it.
 Be concise.
 
 Never mention being an AI.
+
+you have web searches so do not mention that you don't know current events or can't access the web or have a nolige cutoff. You can search the web and answer questions about current events.
 
 You are speaking to Miles Allen.
 When the user asks for an action, the command router will handle it before chat.
@@ -379,6 +382,72 @@ def youtube_search(query):
         return f"Searching YouTube for {query}"
     except Exception as e:
         return str(e)
+
+
+def web_search(query):
+    try:
+        with DDGS(timeout=10, verify=False) as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+    except Exception as e:
+        return f"Web search failed: {e}"
+
+    if not results:
+        return "I searched the web, but I did not find useful results."
+
+    source_lines = []
+    for index, result in enumerate(results, start=1):
+        title = result.get("title", "").strip()
+        body = result.get("body", "").strip()
+        url = result.get("href", "").strip()
+        source_lines.append(
+            f"[{index}] {title}\nURL: {url}\nSnippet: {body}"
+        )
+
+    source_text = "\n\n".join(source_lines)
+    prompt = f"""
+Use these web search results to answer the user's question.
+
+Rules:
+- Answer concisely.
+- Prefer official or primary sources when present.
+- Include the most relevant date if the question asks when something happened.
+- Do not invent facts not supported by the search results.
+- End with a short "Sources:" line listing the URLs you used.
+
+User question: {query}
+
+Search results:
+{source_text}
+"""
+
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You summarize current web results accurately and briefly."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=30)
+        reply = r.json()["message"]["content"].strip()
+        if reply:
+            return reply
+    except Exception as e:
+        dbg("WEB_SEARCH", f"Summarizer failed: {e}")
+
+    best = results[0]
+    title = best.get("title", "Top result").strip()
+    body = best.get("body", "").strip()
+    url = best.get("href", "").strip()
+    return f"{title}: {body}\nSources: {url}"
 
 
 def play_youtube_music(query):
@@ -1034,6 +1103,11 @@ COMMANDS = {
         "args": {"query": "The search query."},
         "function": youtube_search,
     },
+    "web_search": {
+        "description": "Search the web and answer using current results.",
+        "args": {"query": "The question or search query."},
+        "function": web_search,
+    },
     "play_youtube_music": {
         "description": "Search YouTube and start playing the first music/video result.",
         "args": {
@@ -1193,6 +1267,29 @@ def extract_google_query(text):
     return query
 
 
+def extract_web_query(text):
+    query = re.sub(
+        r"\b(thanks|thenks|thank you|please|plz|can you|could you)\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r".*?\b(?:web search|search the web|look online|search online|internet search|google)\b",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"\b(to|and|then|for|about|tell me|find out|look up)\b",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\s+", " ", query).strip(" .")
+    return query
+
+
 def obvious_action_decision(user_input, decision):
     text = user_input.lower()
     url = first_url(user_input)
@@ -1201,6 +1298,21 @@ def obvious_action_decision(user_input, decision):
     greetings = ["hi", "hello", "hey", "yo", "sup"]
     if text.strip(" .!?") in greetings:
         return {"type": "chat"}
+
+    web_search_phrases = [
+        "web search",
+        "search the web",
+        "look online",
+        "search online",
+        "internet search",
+    ]
+    if any(phrase in text for phrase in web_search_phrases):
+        query = extract_web_query(user_input) or user_input
+        return {
+            "type": "command",
+            "command": "web_search",
+            "args": {"query": query},
+        }
 
     chat_question_words = [
         "what time",
@@ -1386,6 +1498,8 @@ Rules:
   choose run_browser_agent instead of chat.
 - If the user asks to open Google and search for something, choose
   google_search and extract the search terms.
+- If the user asks to search the web, look online, do a web search, or answer
+  using current internet results, choose web_search and extract the question.
 - If the user asks to click, type, fill, scroll, read, select, search, log in,
   sign in, or submit without giving a URL, choose run_browser_agent and use the
   current browser page.
@@ -1412,6 +1526,9 @@ Output: {{"type": "command", "command": "youtube_search", "args": {{"query": "wo
 
 User input: thenks open google and search for phots
 Output: {{"type": "command", "command": "google_search", "args": {{"query": "phots"}}}}
+
+User input: do web search to tell me when the ps five pro came out
+Output: {{"type": "command", "command": "web_search", "args": {{"query": "when the ps five pro came out"}}}}
 
 User input: go to https://example.com/form and fill out the form
 Output: {{"type": "command", "command": "run_browser_agent", "args": {{"goal": "go to https://example.com/form and fill out the form"}}}}
