@@ -40,10 +40,35 @@ _parser.add_argument(
     "-t", "--text", action="store_true", help="Run NOVA in text mode"
 )
 
+_parser.add_argument(
+    "--ui",
+    action="store_true",
+    help="Loaded by ui.py (skip CLI main loop)",
+)
+
 _args = _parser.parse_args()
 
 DEBUG = _args.debug
 TEXT_MODE = _args.text
+UI_MODE = _args.ui
+
+
+# UI bridge (ui.py registers a callback)
+_ui_emit_fn = None
+
+
+def set_ui_emit(callback):
+    """ui.py calls this to receive wake/voice/command events."""
+    global _ui_emit_fn
+    _ui_emit_fn = callback
+
+
+def ui_emit(event, *payload):
+    if _ui_emit_fn:
+        try:
+            _ui_emit_fn(event, *payload)
+        except Exception as e:
+            dbg("UI", str(e))
 
 
 # DEBUG
@@ -76,6 +101,29 @@ MEMORY_FILE = "nova_memory.json"
 
 LOG_FILE = "nova.log"
 
+BROWSER_USER_DATA = os.path.expanduser("~/jarvis/browser_profile")
+UBLOCK_EXTENSION_PATH = os.path.expanduser(
+    "~/jarvis/extensions/uBlock0.chromium"
+)
+
+AD_URL_FRAGMENTS = (
+    "doubleclick.net",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "google-analytics.com",
+    "googletagmanager.com/gtm",
+    "youtube.com/api/stats/ads",
+    "youtube.com/get_midroll",
+    "youtube.com/pagead/",
+    "youtube.com/ptracking",
+    "youtube.com/generate_204",
+    "adservice.google",
+    "ads.youtube.com",
+    "adclick",
+    "/ads?",
+    "googlesyndication",
+)
+
 WEATHER_LOCATION = "Toronto"
 
 SAFE_MODE = True
@@ -102,6 +150,8 @@ logging.basicConfig(
 
 SYSTEM_PROMPT = """
 You are NOVA.
+
+If as for your name respond with nova which stands for novel operating variability assistant.
 
 You are a system assistant.
 You are a refined British-style computer assistant.
@@ -330,15 +380,121 @@ browser = None
 page = None
 
 
+def _should_block_request(request):
+    url = request.url.lower()
+    if any(fragment in url for fragment in AD_URL_FRAGMENTS):
+        return True
+    if request.resource_type in ("image", "media", "font"):
+        if any(x in url for x in ("doubleclick", "googlesyndication", "/ads/", "adserver")):
+            return True
+    return False
+
+
+def _handle_browser_route(route):
+    try:
+        if _should_block_request(route.request):
+            route.abort()
+        else:
+            route.continue_()
+    except Exception:
+        try:
+            route.continue_()
+        except Exception:
+            pass
+
+
+def dismiss_youtube_ui(target_page=None):
+    """Close consent dialogs, error banners, and skip ads when possible."""
+    pg = target_page or page
+    if not pg:
+        return
+
+    for text in (
+        "Accept all",
+        "Reject all",
+        "I agree",
+        "No thanks",
+        "Not now",
+        "Dismiss",
+    ):
+        try:
+            pg.get_by_role("button", name=re.compile(text, re.I)).first.click(
+                timeout=1200
+            )
+            time.sleep(0.4)
+        except Exception:
+            pass
+
+    for sel in (
+        ".ytp-ad-skip-button",
+        ".ytp-skip-ad-button",
+        "button.ytp-ad-skip-button-modern",
+        ".ytp-ad-skip-button-modern",
+    ):
+        try:
+            pg.locator(sel).first.click(timeout=800)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    try:
+        pg.evaluate(
+            """() => {
+            const err = document.querySelector(
+                'yt-playability-error-supported-renderers, .error-screen, #error-screen'
+            );
+            if (err) {
+                const btn = document.querySelector('button[aria-label*="Retry"], #button');
+                if (btn) btn.click();
+            }
+        }"""
+        )
+    except Exception:
+        pass
+
+
 def init_browser():
     global playwright_instance, browser, page
 
     if browser:
         return
 
+    os.makedirs(BROWSER_USER_DATA, exist_ok=True)
     playwright_instance = sync_playwright().start()
-    browser = playwright_instance.chromium.launch(headless=False)
-    page = browser.new_page()
+
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-default-browser-check",
+    ]
+    if os.path.isdir(UBLOCK_EXTENSION_PATH):
+        launch_args.extend(
+            [
+                f"--disable-extensions-except={UBLOCK_EXTENSION_PATH}",
+                f"--load-extension={UBLOCK_EXTENSION_PATH}",
+            ]
+        )
+        print("🛡️  uBlock extension loaded")
+    else:
+        print(
+            "🛡️  Network ad blocking active "
+            f"(optional uBlock: {UBLOCK_EXTENSION_PATH})"
+        )
+
+    browser = playwright_instance.chromium.launch_persistent_context(
+        user_data_dir=BROWSER_USER_DATA,
+        headless=False,
+        args=launch_args,
+        viewport={"width": 1360, "height": 860},
+        locale="en-US",
+        ignore_default_args=["--enable-automation"],
+    )
+    page = browser.pages[0] if browser.pages else browser.new_page()
+    page.route("**/*", _handle_browser_route)
+    page.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        """
+    )
     print("🌐 Browser ready")
 
 
@@ -412,7 +568,7 @@ Rules:
 - Prefer official or primary sources when present.
 - Include the most relevant date if the question asks when something happened.
 - Do not invent facts not supported by the search results.
-- End with a short "Sources:" line listing the URLs you used.
+  - Do not include source URLs in the answer.
 
 User question: {query}
 
@@ -459,14 +615,7 @@ def play_youtube_music(query):
             wait_until="domcontentloaded",
         )
         time.sleep(2)
-
-        for text in ["Accept all", "I agree", "No thanks"]:
-            try:
-                page.get_by_text(text, exact=True).click(timeout=1500)
-                time.sleep(1)
-                break
-            except:
-                pass
+        dismiss_youtube_ui()
 
         selectors = [
             "ytd-video-renderer a#video-title",
@@ -481,6 +630,8 @@ def play_youtube_music(query):
                 title = first_video.inner_text().strip()
                 first_video.click()
                 page.wait_for_load_state("domcontentloaded", timeout=10000)
+                time.sleep(1.5)
+                dismiss_youtube_ui()
                 return f"Playing {title or query} on YouTube."
             except Exception as e:
                 dbg("YOUTUBE", f"{selector} failed: {e}")
@@ -1047,8 +1198,11 @@ def command_cancel_discord_send():
 
 
 def command_remember(text):
+    text = (text or "").strip()
+    if not text:
+        return "I need something to remember."
     remember(text)
-    return "Memory stored"
+    return f"Stored in memory: {text}"
 
 
 def command_forget(text):
@@ -1267,6 +1421,33 @@ def extract_google_query(text):
     return query
 
 
+def extract_remember_text(text):
+    patterns = (
+        r"\bremember(?:\s+that|\s+to)?\s+(.+)",
+        r"\bdon'?t\s+forget(?:\s+that|\s+to)?\s+(.+)",
+        r"\bkeep\s+in\s+mind(?:\s+that)?\s+(.+)",
+        r"\bstore\s+in\s+memory(?:\s+that)?\s+(.+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" .!?")
+    return None
+
+
+def extract_forget_text(text):
+    patterns = (
+        r"\bforget(?:\s+about|\s+that)?\s+(.+)",
+        r"\bremove\s+from\s+memory(?:\s+that)?\s+(.+)",
+        r"\bdelete\s+memory(?:\s+about)?\s+(.+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" .!?")
+    return None
+
+
 def extract_web_query(text):
     query = re.sub(
         r"\b(thanks|thenks|thank you|please|plz|can you|could you)\b",
@@ -1298,6 +1479,22 @@ def obvious_action_decision(user_input, decision):
     greetings = ["hi", "hello", "hey", "yo", "sup"]
     if text.strip(" .!?") in greetings:
         return {"type": "chat"}
+
+    memory_text = extract_remember_text(user_input)
+    if memory_text:
+        return {
+            "type": "command",
+            "command": "remember",
+            "args": {"text": memory_text},
+        }
+
+    forget_text = extract_forget_text(user_input)
+    if forget_text:
+        return {
+            "type": "command",
+            "command": "forget",
+            "args": {"text": forget_text},
+        }
 
     web_search_phrases = [
         "web search",
@@ -1487,6 +1684,9 @@ Rules:
 - Only choose get_system_status if the user asks for system status, CPU, RAM,
   memory usage, disk usage, computer status, or performance.
 - Only choose get_weather if the user asks for weather or temperature.
+- If the user asks to remember, store, or keep something in memory, choose
+  remember and put the fact in text.
+- If the user asks to forget or remove something from memory, choose forget.
 - Use only command names from the available commands list.
 - Extract all required args from the user's words.
 - For run_browser_agent, pass the full user request as goal.
@@ -1602,21 +1802,32 @@ def run_command(decision):
         return str(e)
 
 
-def handle_user_input(user_input):
+def process_input(user_input):
+    """Single entry for CLI and ui.py. Returns {type, text, command?}."""
+    logging.info(f"USER: {user_input}")
     decision = choose_command(user_input)
     decision = obvious_action_decision(user_input, decision)
     dbg("ROUTER_FINAL", json.dumps(decision))
 
     if decision.get("type") == "command":
-        result = run_command(decision)
+        name = decision.get("command", "unknown")
+        ui_emit("command_start", name.upper())
+        result = run_command(decision) or ""
+        ui_emit("command_done", name.upper(), result)
         if result:
             logging.info(f"NOVA: {result}")
             speak(result)
-        return
+        return {"type": "command", "command": name, "text": result}
 
     reply = ask_ollama(user_input)
     logging.info(f"NOVA: {reply}")
+    ui_emit("chat_done", reply)
     speak(reply)
+    return {"type": "chat", "text": reply}
+
+
+def handle_user_input(user_input):
+    process_input(user_input)
 
 
   
@@ -1687,6 +1898,7 @@ def listen_loop():
                 if not active:
                     if any(w in text for w in WAKE_WORDS):
                         print("🟢 Wake word detected")
+                        ui_emit("wake", text)
                         play_chime()
                         active = True
                         wake_time = time.time()
@@ -1724,28 +1936,27 @@ def text_loop():
 
 
   
-# STARTUP
+# STARTUP / MAIN (CLI only — ui.py imports with --ui)
   
 
-print("\nNOVA ONLINE")
+def main():
+    print("\nNOVA ONLINE")
 
-if TEXT_MODE:
-    print("⌨️  Running in TEXT MODE (-t)")
+    if TEXT_MODE:
+        print("⌨️  Running in TEXT MODE (-t)")
 
-if not check_ollama():
-    exit(1)
+    if not check_ollama():
+        exit(1)
+
+    input_source = text_loop() if TEXT_MODE else listen_loop()
+
+    try:
+        for user_input in input_source:
+            print(f"\nYOU: {user_input}")
+            handle_user_input(user_input)
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye")
 
 
-# MAIN LOOP
-  
-
-input_source = text_loop() if TEXT_MODE else listen_loop()
-
-try:
-    for user_input in input_source:
-
-        print(f"\nYOU: {user_input}")
-        logging.info(f"USER: {user_input}")
-        handle_user_input(user_input)
-except KeyboardInterrupt:
-    print("\n👋 Goodbye")
+if __name__ == "__main__":
+    main()
