@@ -2,6 +2,12 @@
 
 Multi-modal AI assistant with desktop GUI, web interface, and CLI. Runs on Ollama.
 
+<p align="center">
+  <a href="https://ai.fedl.site">
+    <img src="https://img.shields.io/badge/Demo-Click%20Here-blue?style=for-the-badge" alt="Demo Link">
+  </a>
+</p>
+
 <a herf="Can you tell me about world events?">demo</a>
 
 ## Quick Start
