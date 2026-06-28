@@ -43,6 +43,8 @@ except Exception as _import_err:
 
 _SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 _ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+os.makedirs(_WORKSPACE_DIR, exist_ok=True)
 
 # UI thread events
 ui_events = queue.Queue()
@@ -1462,11 +1464,6 @@ class NovaUI:
         else:
             self._stat_labels["CPU"].config(text="n/a")
 
-        online = jarvis.check_ollama()
-        self._stat_labels["OLLAMA"].config(
-            text="ONLINE" if online else "OFFLINE",
-            fg=Theme.SUCCESS if online else Theme.DANGER,
-        )
         self._stat_labels["VOICE"].config(
             text="ONLINE" if self._voice_online else "OFFLINE",
             fg=Theme.SUCCESS if self._voice_online else Theme.DANGER,

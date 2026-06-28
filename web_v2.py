@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""NOVA V2 Web Server — ReAct agent accessible from your phone."""
+
+import os
+import sys
+import json
+import asyncio
+import re as _re
+
+if "--ui" not in sys.argv:
+    sys.argv.insert(1, "--ui")
+
+try:
+    import jarvis_v2
+except Exception as e:
+    print(f"[WEBV2] Could not import jarvis_v2.py: {e}")
+    sys.exit(1)
+
+from aiohttp import web
+
+HOST = os.environ.get("NOVA_HOST", "0.0.0.0")
+PORT = int(os.environ.get("NOVA_PORT", "9090"))
+
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>NOVA V2</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e0e0e0;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.hdr{padding:10px 14px;border-bottom:1px solid #2a2a3a;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;background:#0a0a0f}
+.hdr .ttl{font-size:16px;font-weight:700;background:linear-gradient(90deg,#8b5cf6,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:2px}
+.hdr .st{display:flex;align-items:center;gap:5px;font-size:11px;color:#6b7280}
+.hdr .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.hdr .dot.on{background:#22c55e;box-shadow:0 0 8px #22c55e}
+.hdr .dot.off{background:#ef4444}
+.hdr .badge{font-size:9px;background:#2a2a3a;color:#6b7280;padding:2px 6px;border-radius:4px}
+.chat{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px;scroll-behavior:smooth}
+.msg{max-width:90%;padding:10px 14px;border-radius:12px;font-size:14px;line-height:1.5;word-wrap:break-word}
+.msg.u{background:#1a1a2e;border:1px solid #8b5cf6;color:#e0e0e0;align-self:flex-end}
+.msg.a{background:#111827;border:1px solid #06b6d4;color:#e0e0e0;align-self:flex-start}
+.msg.tool{padding:6px 10px;font-size:11px;border-radius:6px;align-self:center;background:#1a1a2e;border:1px solid #374151;color:#9ca3af;font-family:monospace;max-width:100%}
+.msg.tool .name{color:#8b5cf6;font-weight:600}
+.msg.tool .res{color:#06b6d4}
+.msg.err{padding:6px 10px;font-size:11px;border-radius:6px;align-self:center;background:#2a0a0a;border:1px solid #ef4444;color:#fca5a5;font-family:monospace;max-width:100%}
+.ld{text-align:center;padding:12px;color:#6b7280;font-size:12px;align-self:center}
+.ld .sp{display:inline-block;width:18px;height:18px;border:2px solid #374151;border-top-color:#8b5cf6;border-radius:50%;animation:s .8s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes s{to{transform:rotate(360deg)}}
+.inp{padding:10px 12px;border-top:1px solid #2a2a3a;display:flex;gap:8px;flex-shrink:0;background:#0a0a0f}
+.inp input{flex:1;padding:11px 16px;border-radius:22px;border:1px solid #374151;background:#111827;color:#e0e0e0;font-size:15px;outline:0}
+.inp input:focus{border-color:#8b5cf6}
+.inp button{width:42px;height:42px;border-radius:50%;border:0;background:linear-gradient(135deg,#8b5cf6,#06b6d4);color:#fff;font-size:18px;cursor:pointer;flex-shrink:0}
+.inp button:disabled{opacity:.35}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div class="ttl">NOVA V2</div>
+  <div style="display:flex;align-items:center;gap:8px">
+    <span class="badge">ReAct</span>
+    <div class="st"><span class="dot off" id="dot"></span><span id="stText">offline</span></div>
+  </div>
+</div>
+<div class="chat" id="chat"></div>
+<div class="inp">
+  <input type="text" id="input" placeholder="Ask NOVA V2..." autofocus>
+  <button id="sendBtn">→</button>
+</div>
+<script>
+const chat=document.getElementById('chat'),inp=document.getElementById('input'),sendBtn=document.getElementById('sendBtn'),dot=document.getElementById('dot'),stText=document.getElementById('stText');
+let busy=!1;
+function addMsg(t,role){
+  const d=document.createElement('div');
+  if(role==='tool'||role==='err'){
+    d.className='msg '+role;
+    d.innerHTML=t;
+  }else{
+    d.className='msg '+(role==='u'?'u':'a');
+    d.textContent=t;
+  }
+  chat.appendChild(d);
+  chat.scrollTop=chat.scrollHeight;
+  return d;
+}
+function ld(on){
+  const e=document.getElementById('ld');
+  if(e)e.remove();
+  if(on){
+    const d=document.createElement('div');d.id='ld';d.className='ld';
+    d.innerHTML='<span class="sp"></span>thinking...';
+    chat.appendChild(d);chat.scrollTop=chat.scrollHeight;
+  }
+}
+async function send(){
+  const t=inp.value.trim();if(!t||busy)return;
+  inp.value='';busy=!0;sendBtn.disabled=!0;
+  addMsg(t,'u');ld(!0);
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
+    const d=await r.json();
+    ld(!1);
+    if(d.steps)for(const s of d.steps){
+      if(s.type==='tool')addMsg('<span class="name">⟐ '+s.tool+'</span> '+esc(s.args),'tool');
+      else if(s.type==='result')addMsg('<span class="res">▸ result:</span> '+esc(s.result),'tool');
+      else if(s.type==='error')addMsg('⚠ '+esc(s.msg),'err');
+    }
+    addMsg(d.reply||'No response','a');
+  }catch(e){ld(!1);addMsg('Connection error','err')}
+  busy=!1;sendBtn.disabled=!1;inp.focus();
+}
+function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+sendBtn.addEventListener('click',send);
+inp.addEventListener('keydown',e=>{if(e.key==='Enter')send()});
+async function st(){try{const r=await fetch('/api/status');const d=await r.json();dot.className='dot '+(d.ollama?'on':'off');stText.textContent=d.ollama?'online':'offline'}catch{dot.className='dot off';stText.textContent='offline'}}
+st();setInterval(st,15000);
+addMsg('NOVA V2 agent ready. Try: "research AI trends and save to a file"','a');
+</script>
+</body>
+</html>"""
+
+
+# ── Server state per session ─────────────────────────────────────────────
+
+chat_sessions: dict[str, dict] = {}
+
+
+async def handle_index(request):
+    return web.Response(text=INDEX_HTML, content_type="text/html")
+
+
+async def handle_status(request):
+    try:
+        online = jarvis_v2.jarvis.check_ollama()
+    except Exception:
+        online = False
+    return web.json_response({"ollama": online})
+
+
+async def handle_chat(request):
+    try:
+        data = await request.json()
+        text = data.get("text", "").strip()
+        session_id = data.get("session", "default")
+        if not text:
+            return web.json_response({"error": "empty message"}, status=400)
+
+        if session_id not in chat_sessions:
+            chat_sessions[session_id] = {
+                "messages": [{"role": "system", "content": jarvis_v2.AGENT_SYSTEM_PROMPT}]
+            }
+
+        session = chat_sessions[session_id]
+        original_count = len(session["messages"])
+
+        loop = asyncio.get_event_loop()
+
+        def run():
+            reply, messages = jarvis_v2.agent_process(text, session["messages"])
+            session["messages"] = messages
+            new_msgs = messages[original_count:]
+            steps = []
+            for m in new_msgs:
+                role = m["role"]
+                content = m.get("content", "")
+                if role == "tool":
+                    steps.append({"type": "tool", "tool": m.get("name", ""), "args": content[:200]})
+                elif role == "assistant" and content:
+                    if not any(s.get("type") == "result" for s in steps):
+                        pass
+            return {"reply": reply, "steps": steps}
+
+        result = await loop.run_in_executor(None, run)
+        return web.json_response(result)
+
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+def main():
+    app = web.Application()
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/api/status", handle_status)
+    app.router.add_post("/api/chat", handle_chat)
+
+    import socket
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
+
+    print(f"\n  NOVA V2 Web Server")
+    print(f"  {'─' * 40}")
+    print(f"  Local:    http://localhost:{PORT}")
+    print(f"  Network:  http://{local_ip}:{PORT}")
+    print(f"  Phone:    http://{local_ip}:{PORT}")
+    print()
+
+    web.run_app(app, host=HOST, port=PORT, print=lambda _: None)
+
+
+if __name__ == "__main__":
+    main()

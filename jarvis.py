@@ -132,6 +132,9 @@ WAKE_TIMEOUT = 10
 
 WAKE_WORDS = ["hey nova", "nova", "computer", "jarvis"]
 
+WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
 
   
 # LOGGING
@@ -1216,6 +1219,69 @@ def command_edit_memory(old, new):
     return "Memory not found"
 
 
+_write_file_counter = 0
+
+
+def command_write_file(filename, content):
+    global _write_file_counter
+    safe = os.path.basename(filename) if filename else ""
+    if not safe or safe == ".":
+        _write_file_counter += 1
+        safe = f"nova_note_{_write_file_counter}.txt"
+    path = os.path.join(WORKSPACE_DIR, safe)
+    with open(path, "w") as f:
+        f.write(content)
+    size = len(content.encode("utf-8"))
+    return f"Wrote {safe} ({size} bytes) to workspace."
+
+
+def _extract_read_filename(text):
+    m = re.search(
+        r"(?:read|look at|open|check|show me|what(?:'s| is) in)\s+"
+        r"(?:\w+\s+)?(?:file\s+)?"
+        r"['\"]?(.+?\.\w+)['\"]?\b",
+        text, re.IGNORECASE
+    )
+    if m:
+        fn = m.group(1).strip().rstrip(".,!?")
+        if fn:
+            return fn
+    m = re.search(
+        r"(?:read|look at|open|check|show me|what(?:'s| is) in)\s+"
+        r"(?:\w+\s+)?(?:file\s+)?"
+        r"['\"]?(.+?)['\"]?(?:\s+and\s+|$)",
+        text, re.IGNORECASE
+    )
+    if m:
+        fn = m.group(1).strip().rstrip(".,!?")
+        if fn and len(fn) > 1:
+            return fn
+    return None
+
+
+def command_read_file(filename):
+    fn = _extract_read_filename(filename) if not os.path.sep in filename and not os.path.isfile(os.path.join(WORKSPACE_DIR, os.path.basename(filename))) else filename
+    if fn and os.path.sep not in fn:
+        fn = os.path.basename(fn)
+    path = os.path.join(WORKSPACE_DIR, fn or filename)
+    if not os.path.exists(path) or not os.path.isfile(path):
+        parts = (fn or filename).split()
+        if parts:
+            candidate = os.path.join(WORKSPACE_DIR, parts[-1])
+            if os.path.isfile(candidate):
+                path = candidate
+            else:
+                for p in parts:
+                    c = os.path.join(WORKSPACE_DIR, p)
+                    if os.path.isfile(c):
+                        path = c
+                        break
+    if not os.path.exists(path) or not os.path.isfile(path):
+        return None
+    with open(path, "r") as f:
+        return f.read()
+
+
 COMMANDS = {
     "stop_speaking": {
         "description": "Stop NOVA's current spoken response or audio playback.",
@@ -1339,6 +1405,21 @@ COMMANDS = {
             "new": "The replacement memory text.",
         },
         "function": command_edit_memory,
+    },
+    "write_file": {
+        "description": "Write or create a text file in the workspace folder.",
+        "args": {
+            "filename": "The filename (e.g. notes.txt).",
+            "content": "The full text content to write.",
+        },
+        "function": command_write_file,
+    },
+    "read_file": {
+        "description": "Read the contents of a file from the workspace folder.",
+        "args": {
+            "filename": "The filename to read (e.g. notes.txt).",
+        },
+        "function": command_read_file,
     },
 }
 
@@ -1644,6 +1725,72 @@ def obvious_action_decision(user_input, decision):
             "args": {"goal": user_input},
         }
 
+    write_triggers = [
+        "write a file", "create a file", "make a file", "save a file",
+        "write me a file", "make me a file", "make a text file",
+        "create a text file", "write a text file",
+        "create a html", "create an html", "write a html",
+    ]
+    if any(p in text for p in write_triggers):
+        fn = ""
+        ct = ""
+        m = re.search(r"(?:called|named)\s+(\S+)", text, re.IGNORECASE)
+        if m:
+            fn = m.group(1).strip().rstrip(".,!?")
+        if not fn:
+            m = re.search(r"file\s+(?:called\s+)?(\S+\.\w+)", text, re.IGNORECASE)
+            if m:
+                fn = m.group(1).strip().rstrip(".,!?")
+        m = re.search(r"(?:that says|with content|containing|content:?|saying)\s+(.+)$", text, re.IGNORECASE)
+        if m:
+            ct = m.group(1).strip().rstrip(".,!?")
+        if not ct:
+            m = re.search(r"(?:just says|says)\s+(.+)$", text, re.IGNORECASE)
+            if m:
+                ct = m.group(1).strip().rstrip(".,!?")
+        if not ct and fn:
+            after_fn = text.split(fn, 1)[-1].strip().lstrip(".,!? ")
+            if after_fn and len(after_fn) > 3:
+                ct = after_fn
+        return {
+            "type": "command",
+            "command": "write_file",
+            "args": {"filename": fn, "content": ct},
+        }
+
+    if re.search(r"\bread\b", text) and re.search(r"\bfile\b", text):
+        fn = _extract_read_filename(text) or ""
+        return {
+            "type": "command",
+            "command": "read_file",
+            "args": {"filename": fn},
+        }
+    save_triggers = ["write it", "save it", "write that", "save that", "put it in"]
+    if any(p in text for p in save_triggers):
+        fn = ""
+        m = re.search(r"(?:to|as|in)\s+(?:a\s+)?(?:file\s+)?(?:called\s+)?(\S+\.\w+)", text, re.IGNORECASE)
+        if m:
+            fn = m.group(1).strip().rstrip(".,!?")
+        return {
+            "type": "command",
+            "command": "write_file",
+            "args": {"filename": fn, "content": ""},
+        }
+
+    read_triggers = [
+        "look at the file", "look at my file", "look at that file",
+        "open the file", "check the file", "check my file",
+        "what is in the file", "what's in the file",
+        "read me", "read back",
+    ]
+    if any(p in text for p in read_triggers):
+        fn = _extract_read_filename(text) or ""
+        return {
+            "type": "command",
+            "command": "read_file",
+            "args": {"filename": fn},
+        }
+
     return decision
 
 
@@ -1709,6 +1856,8 @@ Rules:
 - If the user only asks to open a specific website, choose open_website.
 - If the user asks what you can do or how commands/tools work, return chat.
 - If a required arg is missing, return chat.
+- For write_file, extract the filename and the full content text from the request.
+- For read_file, extract just the filename.
 - Do not explain your choice.
 
 Examples:
@@ -1747,6 +1896,21 @@ Output: {{"type": "chat"}}
 
 User input: can you tell me whut itme it is in alstaley if it is 10:53 in minasota
 Output: {{"type": "chat"}}
+
+User input: make a text file called hello.txt that says hi
+Output: {{"type": "command", "command": "write_file", "args": {{"filename": "hello.txt", "content": "hi"}}}}
+
+User input: create a file in the workspace named notes.txt with content remember to buy milk
+Output: {{"type": "command", "command": "write_file", "args": {{"filename": "notes.txt", "content": "remember to buy milk"}}}}
+
+User input: can you read the file called todo.txt
+Output: {{"type": "command", "command": "read_file", "args": {{"filename": "todo.txt"}}}}
+
+User input: look at my file data.txt
+Output: {{"type": "command", "command": "read_file", "args": {{"filename": "data.txt"}}}}
+
+User input: read back that file we made earlier
+Output: {{"type": "command", "command": "read_file", "args": {{"filename": ""}}}}
 
 User input: {user_input}
 """
@@ -1812,12 +1976,67 @@ def process_input(user_input):
     if decision.get("type") == "command":
         name = decision.get("command", "unknown")
         ui_emit("command_start", name.upper())
-        result = run_command(decision) or ""
-        ui_emit("command_done", name.upper(), result)
+        result = run_command(decision)
+        ui_emit("command_done", name.upper(), result or "")
+
+        if name == "read_file":
+            if not result:
+                return {"type": "command", "command": name, "text": "File not found in workspace."}
+            if result.startswith("I need a little more"):
+                return {"type": "command", "command": name, "text": "Which file should I read?"}
+            messages.append({"role": "system", "content": f"The user asked you to look at a file. Here is its content:\n\n{result}"})
+            reply = ask_ollama(f"I asked you to look at a file. Respond about what's in it.\n\nFile content:\n{result[:500]}")
+            logging.info(f"NOVA: {reply}")
+            ui_emit("chat_done", reply)
+            speak(reply)
+            return {"type": "chat", "text": reply}
+
+        if name == "write_file":
+            fn = decision.get("args", {}).get("filename", "")
+            ct = decision.get("args", {}).get("content", "")
+            if not fn and not ct:
+                return {"type": "command", "command": name, "text": "What file should I create and what should go in it?"}
+            if fn and ct:
+                code_exts = (".html", ".css", ".js", ".py", ".ts", ".jsx", ".tsx", ".json", ".xml", ".svg", ".sh")
+                is_code = fn.lower().endswith(code_exts)
+                desc_words = ct.split()
+                is_description = len(desc_words) > 4 and not any(c in ct for c in ("<", "{", "(", "```"))
+                if is_code and is_description:
+                    gen = _llm_chat([{"role": "user", "content": f"Generate the content for a file called {fn}. User's description: {ct}\n\nReturn ONLY the raw file content, NO markdown fences, NO explanation."}])
+                    result = command_write_file(fn, gen)
+                    logging.info(f"NOVA: {result}")
+                    speak(result)
+                    return {"type": "command", "command": name, "text": result}
+                result = command_write_file(fn, ct)
+                logging.info(f"NOVA: {result}")
+                speak(result)
+                return {"type": "command", "command": name, "text": result}
+            if fn and (not ct or len(ct) < 5):
+                last_code = None
+                for m in reversed(messages):
+                    if m["role"] == "assistant":
+                        blocks = re.findall(r"```(?:\w+)?\n(.+?)```", m["content"], re.DOTALL)
+                        if blocks:
+                            last_code = blocks[-1].strip()
+                            break
+                        inline = re.findall(r"`([^`]+)`", m["content"])
+                        if inline:
+                            last_code = inline[-1]
+                if last_code:
+                    gen = last_code
+                else:
+                    gen = _llm_chat([{"role": "user", "content": f"Generate the content for a file called {fn}. User's request: {user_input}\n\nReturn ONLY the raw file content, NO markdown fences, NO explanation."}])
+                result = command_write_file(fn, gen)
+                logging.info(f"NOVA: {result}")
+                speak(result)
+                return {"type": "command", "command": name, "text": result}
+            if ct and not fn:
+                return {"type": "command", "command": name, "text": "What should I name the file?"}
+
         if result:
             logging.info(f"NOVA: {result}")
             speak(result)
-        return {"type": "command", "command": name, "text": result}
+        return {"type": "command", "command": name, "text": result or ""}
 
     reply = ask_ollama(user_input)
     logging.info(f"NOVA: {reply}")
@@ -1837,6 +2056,16 @@ def handle_user_input(user_input):
 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
+def _llm_chat(msgs):
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": msgs,
+        "stream": False,
+    }
+    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload)
+    return r.json()["message"]["content"]
+
+
 def ask_ollama(user_input):
     # Inject current memories into context if any exist
     if memory["memories"]:
@@ -1848,18 +2077,8 @@ def ask_ollama(user_input):
         full_input = user_input
 
     messages.append({"role": "user", "content": full_input})
-
-    payload = {
-        "model": CHAT_MODEL,
-        "messages": messages,
-        "stream": False,
-    }
-
-    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload)
-    reply = r.json()["message"]["content"]
-
+    reply = _llm_chat(messages)
     messages.append({"role": "assistant", "content": reply})
-
     return reply
 
 
