@@ -3,7 +3,6 @@
 Uses structured JSON output instead of native tool_calls for reliability on weaker hardware."""
 
 import json
-import os
 import re
 import sys
 

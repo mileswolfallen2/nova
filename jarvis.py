@@ -2,29 +2,80 @@
 # NOVA Voice Assistant
 
 import requests
-import asyncio
 import json
-import subprocess
-import tempfile
 import os
-import queue
-import sounddevice as sd
-import base64
-import time
 import re
-import threading
 import urllib.parse
 import urllib.request
 import logging
-import pyautogui
-import psutil
 import argparse
-import vosk
 
 from ddgs import DDGS
 from datetime import datetime
-from PIL import Image
-from playwright.sync_api import sync_playwright
+
+# ---------------------------------------------------------------------------
+# Optional dependencies — not required for the basic web UI / small model flow
+# ---------------------------------------------------------------------------
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import sounddevice as sd
+    SD_AVAILABLE = True
+except ImportError:
+    sd = None
+    SD_AVAILABLE = False
+
+try:
+    import vosk
+except ImportError:
+    vosk = None
+
+try:
+    import queue
+except ImportError:
+    queue = None
+
+try:
+    import subprocess
+except ImportError:
+    subprocess = None
+
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
+
+try:
+    import asyncio
+except ImportError:
+    asyncio = None
+
+try:
+    import tempfile
+except ImportError:
+    tempfile = None
+
+try:
+    import time
+except ImportError:
+    time = None
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    Image = None
+    PIL_AVAILABLE = False
+
+try:
+    from playwright.sync_api import sync_playwright
+    PW_AVAILABLE = True
+except ImportError:
+    sync_playwright = None
+    PW_AVAILABLE = False
 
 
 # ARGUMENTS
@@ -277,17 +328,24 @@ def get_weather():
 # AUDIO
   
 
-audio_queue = queue.Queue()
+if queue is not None:
+    audio_queue = queue.Queue()
+else:
+    audio_queue = None
 
-model_vosk = vosk.Model(VOSK_MODEL_PATH)
-
-recognizer = vosk.KaldiRecognizer(model_vosk, 16000)
+if vosk is not None:
+    model_vosk = vosk.Model(VOSK_MODEL_PATH)
+    recognizer = vosk.KaldiRecognizer(model_vosk, 16000)
+else:
+    model_vosk = None
+    recognizer = None
 
 speech_process = None
 
 
 def audio_callback(indata, frames, time_info, status):
-    audio_queue.put(bytes(indata))
+    if audio_queue is not None:
+        audio_queue.put(bytes(indata))
 
 
   
@@ -295,6 +353,8 @@ def audio_callback(indata, frames, time_info, status):
   
 # need to replace this with a custom chime sound eventually but for now this is fine and it works so im not gonna mess with it but if i whant this on windos i need to chang it
 def play_chime():
+    if subprocess is None:
+        return
     subprocess.run(["afplay", "/System/Library/Sounds/Hero.aiff"])
 
 
@@ -310,6 +370,8 @@ async def synthesize_edge_tts(text, audio_path):
 
 
 def synthesize_piper(text, audio_path):
+    if subprocess is None:
+        return
     subprocess.run(
         [
             "piper",
@@ -333,6 +395,9 @@ def speak(text):
     if TEXT_MODE:
         return
 
+    if tempfile is None or asyncio is None:
+        return
+
     suffix = ".mp3" if TTS_BACKEND == "edge" else ".wav"
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
@@ -354,6 +419,13 @@ def speak(text):
             except:
                 pass
             return
+
+    if subprocess is None:
+        try:
+            os.remove(audio_path)
+        except:
+            pass
+        return
 
     speech_process = subprocess.Popen(
         [
@@ -407,9 +479,8 @@ def _handle_browser_route(route):
 
 
 def dismiss_youtube_ui(target_page=None):
-    """Close consent dialogs, error banners, and skip ads when possible."""
     pg = target_page or page
-    if not pg:
+    if not pg or time is None:
         return
 
     for text in (
@@ -460,6 +531,9 @@ def init_browser():
     global playwright_instance, browser, page
 
     if browser:
+        return
+    if not PW_AVAILABLE:
+        print("Browser automation unavailable (playwright not installed)")
         return
 
     os.makedirs(BROWSER_USER_DATA, exist_ok=True)
@@ -1104,6 +1178,8 @@ Return raw JSON only. No explanation. No markdown fences."""
 
 
 def open_discord():
+    if subprocess is None:
+        return
     subprocess.Popen(["open", "-a", "Discord"])
 
 
@@ -1138,6 +1214,8 @@ def send_discord_message(user, message):
 
 
 def confirm_discord_send():
+    if pyautogui is None:
+        return "Discord automation unavailable (pyautogui not installed)"
     pending_discord["recipient"] = None
     pending_discord["message"] = None
     pyautogui.press("enter")
@@ -1145,6 +1223,8 @@ def confirm_discord_send():
 
 
 def cancel_discord_send():
+    if pyautogui is None:
+        return "Discord automation unavailable (pyautogui not installed)"
     pending_discord["recipient"] = None
     pending_discord["message"] = None
     pyautogui.press("escape")
@@ -1157,18 +1237,24 @@ def cancel_discord_send():
 
 
 def spotify_play():
+    if subprocess is None:
+        return "Spotify control unavailable"
     script = 'tell application "Spotify" to play'
     subprocess.run(["osascript", "-e", script])
     return "Spotify resumed"
 
 
 def spotify_pause():
+    if subprocess is None:
+        return "Spotify control unavailable"
     script = 'tell application "Spotify" to pause'
     subprocess.run(["osascript", "-e", script])
     return "Spotify paused"
 
 
 def spotify_next():
+    if subprocess is None:
+        return "Spotify control unavailable"
     script = 'tell application "Spotify" to next track'
     subprocess.run(["osascript", "-e", script])
     return "Skipping track"
@@ -2088,6 +2174,12 @@ def ask_ollama(user_input):
 
 
 def listen_loop():
+    if not SD_AVAILABLE:
+        print("[Voice] sounddevice not available — voice disabled")
+        return
+    if vosk is None or audio_queue is None or time is None:
+        print("[Voice] speech recognition unavailable — missing vosk or queue")
+        return
     print("\n🟢 Say wake word...")
 
     with sd.RawInputStream(

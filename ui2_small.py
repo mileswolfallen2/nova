@@ -7,16 +7,9 @@ import tkinter as tk
 import threading
 import math
 import random
-import json
 import os
 import sys
 import queue
-import subprocess
-import wave
-import struct
-import base64
-import io
-import time
 
 try:
     import psutil
@@ -43,7 +36,6 @@ except Exception as _import_err:
     print(f"[UI-SMALL] Could not import jarvis_v2_small.py: {_import_err}")
     sys.exit(1)
 
-_SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 _ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 _WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
 os.makedirs(_WORKSPACE_DIR, exist_ok=True)
@@ -311,67 +303,7 @@ def generate_app_icon(root):
 
 
 
-# Sound effects
 
-
-class SoundManager:
-    MAC_FALLBACKS = {
-        "startup": "/System/Library/Sounds/Hero.aiff",
-        "listen":  "/System/Library/Sounds/Pop.aiff",
-        "think":   "/System/Library/Sounds/Tink.aiff",
-        "success": "/System/Library/Sounds/Glass.aiff",
-        "error":   "/System/Library/Sounds/Basso.aiff",
-    }
-
-    def __init__(self):
-        os.makedirs(_SOUNDS_DIR, exist_ok=True)
-        self._ensure_placeholders()
-
-    def _ensure_placeholders(self):
-        specs = {
-            "startup": (880, 0.12),
-            "listen":  (660, 0.06),
-            "think":   (440, 0.04),
-            "success": (990, 0.1),
-            "error":   (220, 0.15),
-        }
-        for name, (freq, dur) in specs.items():
-            path = os.path.join(_SOUNDS_DIR, f"{name}.wav")
-            if not os.path.exists(path):
-                self._write_beep(path, freq, dur)
-
-    @staticmethod
-    def _write_beep(path, freq, duration, rate=22050):
-        n = int(rate * duration)
-        with wave.open(path, "w") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(rate)
-            for i in range(n):
-                t = i / rate
-                env = 1.0 - (i / n) ** 0.5
-                val = int(16000 * env * math.sin(2 * math.pi * freq * t))
-                wf.writeframes(struct.pack("<h", val))
-
-    def play(self, name):
-        path = os.path.join(_SOUNDS_DIR, f"{name}.wav")
-        if os.path.exists(path):
-            subprocess.Popen(
-                ["afplay", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return
-        fb = self.MAC_FALLBACKS.get(name)
-        if fb and os.path.exists(fb):
-            subprocess.Popen(
-                ["afplay", fb],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-
-sounds = SoundManager()
 
 
 
@@ -494,15 +426,12 @@ class HudBackdrop(tk.Canvas):
 def process_user_input(text):
     global _messages
     try:
-        sounds.play("think")
         ui_events.put(("command_start", "Processing via JSON-mode agent…"))
         reply, messages = agent.agent_process(text, _messages)
         _messages = messages
         ui_events.put(("command_done", "COMPLETE", reply))
-        sounds.play("success")
     except Exception as e:
         ui_events.put(("error", str(e)))
-        sounds.play("error")
 
 
 
@@ -694,29 +623,12 @@ class Particle:
 
 
 class JarvisCore(tk.Canvas):
-    """
-    Enhanced arc-reactor hologram:
-    • Full 3D wireframe sphere with shading & z-depth tinting
-    • Gyroscopic triple-ring assembly with gold/cyan styling
-    • Rotating hex bolt ring
-    • Energy particle field (20 particles)
-    • Plasma arc streaks
-    • State-aware voice rings, aurora shimmer, heat gradient
-    • Wake pulse expanding shockwave
-    • Radar sweep with glow cone
-    • Corona / bloom effect
-    """
-
     def __init__(self, parent, size=420):
         super().__init__(parent, width=size, height=size,
                          bg=Theme.BG, highlightthickness=0)
         self._size   = size
         self._tick   = 0
         self._state  = "idle"
-        self._audio  = 0.0
-        self._wake   = 0.0
-        self._beat   = 0.0   # heart-beat pulse
-        # Particles
         cx = size / 2
         self._particles = (
             [Particle(size * 0.38, Theme.ACCENT_DIM) for _ in range(10)] +
@@ -724,27 +636,16 @@ class JarvisCore(tk.Canvas):
             [Particle(size * 0.45, Theme.PLASMA_DIM)  for _ in range(4)]
         )
 
-    # ── Public API ──────────────────────────────────────────────────────────
     def set_state(self, state):
         self._state = state
 
-    def set_audio_level(self, level):
-        self._audio = max(0.0, min(1.0, level))
-
-    def pulse_wake(self):
-        self._wake = 1.0
-
     def animate(self):
         self._tick += 1
-        if self._wake > 0:
-            self._wake = max(0, self._wake - 0.03)
-        self._beat = 0.5 + 0.5 * math.sin(self._tick * 0.08)
         for p in self._particles:
             p.angle += p.speed
         self._draw()
         self.after(30, self.animate)
 
-    # ── Drawing ─────────────────────────────────────────────────────────────
     def _draw(self):
         self.delete("all")
         s  = self._size
@@ -752,26 +653,16 @@ class JarvisCore(tk.Canvas):
         R  = s * 0.30
         t  = self._tick * 0.04
         state = self._state
-        pulse = 0.10 * math.sin(t * 2.8) + self._audio * 0.35
+        pulse = 0.10 * math.sin(t * 2.8)
 
-        # Choose accent colour per state
-        if state == "speaking":
-            accent = Theme.SUCCESS
-        elif state == "thinking":
-            accent = Theme.GOLD_BRIGHT
-        elif state == "listening":
-            accent = Theme.ACCENT_BRIGHT
-        else:
-            accent = Theme.ACCENT
+        accent = Theme.GOLD_BRIGHT if state == "thinking" else Theme.ACCENT
 
-        # ── 1. Corona bloom (outermost soft glow) ───────────────────────────
         for i in range(12, 0, -1):
             cr = R + 55 + i * 5 + pulse * 20
             alpha = 0.04 + pulse * 0.03
             c = blend_alpha(accent, Theme.BG, alpha * (12 - i) / 12)
             self.create_oval(cx-cr, cy-cr, cx+cr, cy+cr, outline=c, width=1)
 
-        # ── 2. Outer HUD tick ring ───────────────────────────────────────────
         tick_r = R + 54 + pulse * 6
         for i in range(72):
             ang = math.radians(i * 5 + t * 15)
@@ -787,10 +678,8 @@ class JarvisCore(tk.Canvas):
             w   = 2 if major else 1
             self.create_line(x1, y1, x2, y2, fill=col, width=w)
 
-        # ── 3. Radar sweep with glow cone ───────────────────────────────────
         sweep_ang = math.radians(t * 70)
         sweep_r   = R + 50 + pulse * 8
-        # Cone glow (multiple arcs with fading opacity)
         for i in range(8):
             cone_alpha = 0.12 * (1 - i / 8)
             c = blend_alpha(accent, Theme.BG, cone_alpha)
@@ -800,15 +689,12 @@ class JarvisCore(tk.Canvas):
                 extent=35 - i * 2,
                 fill=c, outline="",
             )
-        # Sweep line
         sx = cx + sweep_r * math.cos(sweep_ang)
         sy = cy + sweep_r * math.sin(sweep_ang)
         self.create_line(cx, cy, sx, sy,
                          fill=lerp_color(Theme.BG, accent, 0.6), width=2)
 
-        # ── 4. Triple gyroscopic rings ───────────────────────────────────────
         ring_specs = [
-            # (radius_offset, tilt, rot_speed, color, seg_extent, width)
             (R * 0.70, 18, 0.55,  Theme.GOLD,         38, 3),
             (R * 0.82, 40, -0.85, Theme.ACCENT,        32, 2),
             (R * 0.96, 65, 1.15,  Theme.ACCENT_BRIGHT, 26, 2),
@@ -824,13 +710,11 @@ class JarvisCore(tk.Canvas):
                     outline=col, width=lw, style="arc",
                 )
 
-        # ── 5. Rotating hex bolt ring ────────────────────────────────────────
         hex_orbit = R + 18
         for i in range(6):
             ang = math.radians(60 * i + t * 25)
             hx = cx + hex_orbit * math.cos(ang)
             hy = cy + hex_orbit * math.sin(ang)
-            # Mini hex at each bolt
             bolt_r = 5 + pulse * 2
             pts = []
             for j in range(6):
@@ -838,26 +722,21 @@ class JarvisCore(tk.Canvas):
                 pts += [hx + bolt_r * math.cos(a2), hy + bolt_r * math.sin(a2)]
             self.create_polygon(pts, outline=Theme.GOLD, fill=Theme.GOLD_DIM, width=1)
 
-        # ── 6. Full 3D wireframe sphere with z-depth shading ─────────────────
         n_lat, n_lon = 14, 20
         tilt  = 0.42
         rot_x = t * 0.12
         rot_y = t * 0.20
 
         def project(lat, lon):
-            # Sphere → rotate → project
             x3 = math.cos(lat) * math.cos(lon + rot_y)
             y3 = math.sin(lat)
             z3 = math.cos(lat) * math.sin(lon + rot_y)
-            # Tilt around X axis
             y4 = y3 * math.cos(tilt) - z3 * math.sin(tilt)
             z4 = y3 * math.sin(tilt) + z3 * math.cos(tilt)
-            # Rotate around Y (slow wobble)
             x5 = x3 * math.cos(rot_x) + z4 * math.sin(rot_x)
             z5 = -x3 * math.sin(rot_x) + z4 * math.cos(rot_x)
             return x5, y4, z5
 
-        # Latitude lines
         for li in range(n_lat):
             lat = -math.pi/2 + math.pi * li / (n_lat - 1)
             pts = []
@@ -875,7 +754,6 @@ class JarvisCore(tk.Canvas):
             if len(pts) >= 4:
                 self._draw_sphere_seg(pts, zs, R, cx, cy, pulse, accent, state)
 
-        # Longitude lines
         for lj in range(n_lon):
             lon = 2 * math.pi * lj / n_lon
             pts = []
@@ -893,8 +771,7 @@ class JarvisCore(tk.Canvas):
             if len(pts) >= 4:
                 self._draw_sphere_seg(pts, zs, R, cx, cy, pulse, accent, state)
 
-        # ── 7. Plasma arc streaks ────────────────────────────────────────────
-        if state in ("thinking", "speaking", "listening"):
+        if state == "thinking":
             for i in range(3):
                 arc_ang = t * 60 + i * 120
                 arc_r   = R * 1.05 + pulse * 10
@@ -905,24 +782,17 @@ class JarvisCore(tk.Canvas):
                     outline=Theme.PLASMA, width=1, style="arc",
                 )
 
-        # ── 8. Energy particles ───────────────────────────────────────────────
         for p in self._particles:
             bob = math.sin(p.phase + t * 1.5) * 6
             px  = cx + (p.orbit_r + bob) * math.cos(p.angle)
             py  = cy + (p.orbit_r + bob * 0.5) * math.sin(p.angle)
             r   = p.size * (1 + pulse * 0.5)
-            # Glow halo
             self.create_oval(px-r*2.5, py-r*2.5, px+r*2.5, py+r*2.5,
                              fill=p.color, outline="")
-            # Bright core
             bright_col = lerp_color(p.color, Theme.CORE, 0.5)
             self.create_oval(px-r, py-r, px+r, py+r,
                              fill=bright_col, outline="")
 
-        # ── 9. State voice / activity rings ─────────────────────────────────
-        self._draw_state_rings(cx, cy, R, t, accent, pulse)
-
-        # ── 10. Arc reactor core ─────────────────────────────────────────────
         core_r = R * (0.20 + 0.04 * math.sin(t * 5) + pulse * 0.06)
 
         # Heat gradient rings (outer to inner)
@@ -966,103 +836,19 @@ class JarvisCore(tk.Canvas):
         self.create_oval(cx-4, cy-4, cx+4, cy+4,
                          fill=Theme.CORE, outline=Theme.ACCENT_BRIGHT, width=1)
 
-        # ── 11. Wake shockwave ────────────────────────────────────────────────
-        if self._wake > 0:
-            for i in range(3):
-                offset = i * 15
-                wr = R + 60 + offset + 60 * (1 - self._wake)
-                alpha = self._wake * (0.9 - i * 0.25)
-                c = blend_alpha(Theme.ACCENT_BRIGHT, Theme.BG, alpha)
-                self.create_oval(cx-wr, cy-wr, cx+wr, cy+wr,
-                                 outline=c, width=max(1, int(3 * self._wake)))
-
     def _draw_sphere_seg(self, pts, zs, R, cx, cy, pulse, accent, state):
         if len(pts) < 4 or not zs:
             return
         avg_z = sum(zs) / len(zs)
-        # Brightness: front face bright, back face dark
         brightness = 0.15 + 0.60 * max(0, avg_z)
-        # State tint
         if state == "thinking":
             col = lerp_color(Theme.BG, Theme.GOLD_BRIGHT, brightness * 0.85)
-        elif state == "speaking":
-            col = lerp_color(Theme.BG, Theme.SUCCESS, brightness * 0.85)
-        elif state == "listening":
-            col = lerp_color(Theme.BG, Theme.ACCENT_BRIGHT, brightness)
         else:
             col = lerp_color(Theme.BG, accent, brightness)
         try:
             self.create_line(*pts, fill=col, width=1, smooth=True)
         except Exception:
             pass
-
-    def _draw_state_rings(self, cx, cy, R, t, accent, pulse):
-        state = self._state
-        if state == "idle":
-            # Slow breathing ring
-            br = R + 30 + 6 * math.sin(t * 0.7)
-            self.create_oval(cx-br, cy-br, cx+br, cy+br,
-                             outline=Theme.PANEL_EDGE, width=1)
-            return
-
-        if state == "listening":
-            for i in range(5):
-                ph = t * 4.0 - i * 0.65
-                r  = R + 24 + i * 9 + 7 * math.sin(ph)
-                alpha = 0.2 + 0.25 * math.sin(ph)
-                c = blend_alpha(accent, Theme.BG, max(0, alpha))
-                self.create_oval(cx-r, cy-r, cx+r, cy+r, outline=c, width=2)
-            # Equalizer bars
-            for i in range(12):
-                ang = math.radians(i * 30 + t * 10)
-                h_bar = 8 + 14 * abs(math.sin(t * 5 + i * 0.7))
-                x1 = cx + (R + 14) * math.cos(ang)
-                y1 = cy + (R + 14) * math.sin(ang)
-                x2 = cx + (R + 14 + h_bar) * math.cos(ang)
-                y2 = cy + (R + 14 + h_bar) * math.sin(ang)
-                self.create_line(x1, y1, x2, y2, fill=accent, width=2)
-
-        elif state == "thinking":
-            # Spinning dashed arcs + rotating spokes
-            for i in range(3):
-                ang = t * 2.2 + i * (2 * math.pi / 3)
-                spoke_r = R + 38
-                self.create_line(cx, cy,
-                                 cx + spoke_r * math.cos(ang),
-                                 cy + spoke_r * math.sin(ang),
-                                 fill=Theme.GOLD, width=2)
-                # Counter-rotating ring
-                rr = R + 28 + i * 8
-                self.create_arc(cx-rr, cy-rr, cx+rr, cy+rr,
-                                start=math.degrees(ang) * (-1),
-                                extent=55,
-                                outline=Theme.GOLD_DIM, width=1, style="arc")
-            # Orbit dot
-            od_ang = t * 3.5
-            od_r   = R + 42
-            odx = cx + od_r * math.cos(od_ang)
-            ody = cy + od_r * math.sin(od_ang)
-            self.create_oval(odx-4, ody-4, odx+4, ody+4,
-                             fill=Theme.GOLD_BRIGHT, outline="")
-
-        elif state == "speaking":
-            # Elliptical voice waveform rings
-            for i in range(7):
-                wave = abs(math.sin(t * 6 + i * 0.8)) * (1 + pulse * 0.5)
-                r  = R + 20 + i * 5 + wave * 14
-                ry = r * (0.45 + wave * 0.15)
-                c  = lerp_color(Theme.BG, Theme.SUCCESS, 0.15 + wave * 0.55)
-                self.create_oval(cx-r, cy-ry, cx+r, cy+ry, outline=c, width=1)
-            # Frequency spikes
-            for i in range(24):
-                ang = math.radians(i * 15)
-                spike = 6 + 16 * abs(math.sin(t * 7 + i))
-                x1 = cx + (R + 18) * math.cos(ang)
-                y1 = cy + (R + 18) * math.sin(ang)
-                x2 = cx + (R + 18 + spike) * math.cos(ang)
-                y2 = cy + (R + 18 + spike) * math.sin(ang)
-                self.create_line(x1, y1, x2, y2,
-                                 fill=lerp_color(Theme.BG, Theme.SUCCESS, 0.5), width=1)
 
 
 
@@ -1174,18 +960,6 @@ class MemoryViewer(tk.Toplevel):
 
 
 
-# Voice bridge
-
-
-def voice_bridge_thread():
-    try:
-        ui_events.put(("voice_status", True))
-        for utterance in agent.jarvis.listen_loop():
-            ui_events.put(("voice_input", utterance))
-    except Exception as e:
-        print(f"[UI Voice] {e}")
-        ui_events.put(("voice_status", False))
-
 
 
 # Main UI
@@ -1202,7 +976,6 @@ class NovaUI:
         self._state         = "idle"
         self._busy          = False
         self._cmd_card      = None
-        self._voice_online  = False
         self._panel_visible = False
 
         apply_hud_widget_defaults(self.root)
@@ -1223,9 +996,7 @@ class NovaUI:
         self._update_stats()
         self._tick_clock()
 
-        sounds.play("startup")
         self.root.after(300, self._startup_check)
-        threading.Thread(target=voice_bridge_thread, daemon=True).start()
 
     # ── Layout ───────────────────────────────────────────────────────────────
     def _build(self):
@@ -1242,19 +1013,6 @@ class NovaUI:
                  fg=Theme.ACCENT_BRIGHT, bg=Theme.BG).pack(anchor="w")
         tk.Label(title_block, text="Novel Operating Variability Assistant",
                  font=FONT_HUD_SM, fg=Theme.GOLD_DIM, bg=Theme.BG).pack(anchor="w")
-
-        self._wake_frame = tk.Frame(header, bg=Theme.BG)
-        self._wake_frame.pack(side="left", padx=16)
-        tk.Label(self._wake_frame, text="VOICE TRIGGER", font=FONT_HUD_SM,
-                 fg=Theme.TEXT_DIM, bg=Theme.BG).pack(side="left")
-        self._wake_word_lbl = tk.Label(self._wake_frame, text='"NOVA"',
-                                        font=FONT_HUD_BOLD, fg=Theme.GOLD, bg=Theme.BG)
-        self._wake_word_lbl.pack(side="left", padx=(6, 0))
-        self._wake_indicator = tk.Canvas(self._wake_frame, width=12, height=12,
-                                          bg=Theme.BG, highlightthickness=0)
-        self._wake_indicator.pack(side="left", padx=8)
-        self._wake_dot = self._wake_indicator.create_oval(
-            2, 2, 10, 10, fill=Theme.ACCENT_DIM, outline=Theme.ACCENT)
 
         self._time_lbl = tk.Label(header, text="", font=FONT_DATA,
                                    fg=Theme.ACCENT, bg=Theme.BG)
@@ -1305,7 +1063,7 @@ class NovaUI:
         tk.Label(self._stats_frame, text="◈ SYSTEM DIAGNOSTICS",
                  font=FONT_CHAT_LABEL, fg=Theme.GOLD, bg=Theme.PANEL).pack(anchor="w", pady=(0, 8))
         self._stat_labels = {}
-        for key in ("CPU", "RAM", "GPU", "TEMP", "OLLAMA", "VOICE", "MEMORY"):
+        for key in ("CPU", "RAM", "GPU", "TEMP", "OLLAMA", "MEMORY"):
             row = tk.Frame(self._stats_frame, bg=Theme.PANEL)
             row.pack(fill="x", pady=3)
             tk.Label(row, text=key, font=FONT_HUD_SM, fg=Theme.TEXT_DIM,
@@ -1321,10 +1079,6 @@ class NovaUI:
         HudButton(btn_row, text="◈ PROTOCOLS", command=self._open_palette).pack(side="left", padx=(0, 8))
         HudButton(btn_row, text="◈ COMMS", accent=True,
                   command=self._toggle_chat).pack(side="left")
-
-        self._voice_lbl = tk.Label(left, text="AUDIO  …", font=FONT_HUD_SM,
-                                    fg=Theme.TEXT_DIM, bg=Theme.BG)
-        self._voice_lbl.pack(padx=16, anchor="w", pady=8)
 
         tk.Frame(lower, bg=Theme.ACCENT_DIM, width=1).pack(side="left", fill="y")
 
@@ -1360,7 +1114,7 @@ class NovaUI:
 
         self._footer = tk.Frame(root, bg=Theme.BG, height=28)
         tk.Label(self._footer,
-                 text="Ctrl+T toggle interface  ·  Ctrl+K protocols  ·  Voice active",
+                 text="Ctrl+T toggle interface  ·  Ctrl+K protocols",
                  font=FONT_HUD_SM, fg=Theme.TEXT_DIM, bg=Theme.BG).pack(
                      side="left", padx=20, pady=5)
 
@@ -1414,23 +1168,13 @@ class NovaUI:
     def _set_state(self, state):
         self._state = state
         labels = {
-            "idle":      ("◈ STANDBY",     Theme.TEXT_DIM),
-            "listening": ("◈ RECEIVING",   Theme.ACCENT_BRIGHT),
-            "thinking":  ("◈ PROCESSING",  Theme.GOLD),
-            "speaking":  ("◈ TRANSMITTING",Theme.SUCCESS),
+            "idle":     ("◈ STANDBY",    Theme.TEXT_DIM),
+            "thinking": ("◈ PROCESSING", Theme.GOLD),
         }
         text, color = labels.get(state, ("◈ STANDBY", Theme.TEXT_DIM))
         self._mode_lbl.config(text=text, fg=color)
         self._state_hdr.config(text=text.replace("◈ ", ""), fg=color)
         self._orb.set_state(state)
-        lvl = 0.3 if state == "listening" else (0.55 if state == "speaking" else 0.0)
-        self._orb.set_audio_level(lvl)
-
-    def _flash_wake(self):
-        self._orb.pulse_wake()
-        self._wake_indicator.itemconfig(self._wake_dot, fill=Theme.ACCENT_BRIGHT)
-        self.root.after(800, lambda: self._wake_indicator.itemconfig(
-            self._wake_dot, fill=Theme.ACCENT_DIM))
 
     def _startup_check(self):
         if agent.jarvis.check_ollama():
@@ -1439,8 +1183,6 @@ class NovaUI:
         else:
             self._chat.add_system("⚠ Ollama offline. Start Ollama and retry.")
             self._stat_labels["OLLAMA"].config(text="OFFLINE", fg=Theme.DANGER)
-        wake = ", ".join(f'"{w}"' for w in agent.jarvis.WAKE_WORDS[:3])
-        self._wake_word_lbl.config(text=wake.upper() if wake else '"NOVA"')
 
     def _update_stats(self):
         if psutil:
@@ -1467,10 +1209,6 @@ class NovaUI:
         else:
             self._stat_labels["CPU"].config(text="n/a")
 
-        self._stat_labels["VOICE"].config(
-            text="ONLINE" if self._voice_online else "OFFLINE",
-            fg=Theme.SUCCESS if self._voice_online else Theme.DANGER,
-        )
         agent.jarvis.load_memory()
         n = len(agent.jarvis.memory.get("memories", []))
         self._stat_labels["MEMORY"].config(text=str(n))
@@ -1515,14 +1253,6 @@ class NovaUI:
         self._set_state("thinking")
         threading.Thread(target=process_user_input, args=(text,), daemon=True).start()
 
-    def _on_voice_input(self, text):
-        if self._busy:
-            return
-        self._chat.add_user(f"🎤 {text}")
-        self._busy = True
-        self._set_state("thinking")
-        threading.Thread(target=process_user_input, args=(text,), daemon=True).start()
-
     def _poll_events(self):
         try:
             while True:
@@ -1536,18 +1266,6 @@ class NovaUI:
         kind = ev[0]
         if kind == "state":
             self._set_state(ev[1])
-        elif kind == "wake":
-            self._flash_wake()
-            self._chat.add_system("Voice trigger acknowledged. Listening…")
-            self._set_state("listening")
-        elif kind == "voice_input":
-            self._on_voice_input(ev[1])
-        elif kind == "voice_status":
-            self._voice_online = ev[1]
-            self._voice_lbl.config(
-                text="AUDIO  ONLINE" if ev[1] else "AUDIO  OFFLINE",
-                fg=Theme.SUCCESS if ev[1] else Theme.DANGER,
-            )
         elif kind == "command_start":
             self._cmd_card = self._chat.add_command(ev[1], "RUNNING")
         elif kind == "command_done":
@@ -1556,23 +1274,18 @@ class NovaUI:
             self._cmd_card = None
             if len(ev) > 2 and ev[2]:
                 self._chat.add_nova(ev[2])
-            self._finish_turn(speaking=True)
+            self._finish_turn()
         elif kind == "chat_done":
             self._chat.add_nova(ev[1])
-            self._finish_turn(speaking=True)
+            self._finish_turn()
         elif kind == "error":
             self._chat.add_system(f"Error: {ev[1]}")
-            sounds.play("error")
             self._finish_turn()
 
-    def _finish_turn(self, speaking=False):
+    def _finish_turn(self):
         self._busy = False
         self._send_btn.config(state="normal")
-        if speaking:
-            self._set_state("speaking")
-            self.root.after(2800, lambda: self._set_state("idle"))
-        else:
-            self._set_state("idle")
+        self._set_state("idle")
 
 
 

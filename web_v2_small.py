@@ -3,7 +3,6 @@
 
 import os
 import sys
-import json
 import asyncio
 
 if "--ui" not in sys.argv:
