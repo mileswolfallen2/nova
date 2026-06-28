@@ -6,8 +6,8 @@ Multi-modal AI assistant with desktop GUI, web interface, and CLI. Runs on Ollam
 
 ```bash
 pip install -r requirements.txt
-ollama pull llama3.2
-python ui2.py          # V2 desktop GUI (recommended)
+ollama pull qwen2.5:1.5b
+python ui2_small.py    # V2 Small desktop GUI (green theme, for 1B-3B models)
 ```
 
 ## Entry Points
@@ -17,6 +17,8 @@ python ui2.py          # V2 desktop GUI (recommended)
 | `python ui2.py` | **V2** | Desktop GUI (Tkinter, animated HUD) |
 | `python web_v2.py` | **V2** | Web server on `:9090` |
 | `python jarvis_v2.py` | **V2** | CLI — native tool-calling agent |
+| `python ui2_small.py` | **V2** | Desktop GUI — JSON-mode for small models (green theme) |
+| `python web_v2_small.py` | **V2** | Web server on `:9091` — JSON-mode for small models |
 | `python jarvis_v2_small.py` | **V2** | CLI — JSON-mode agent for small models |
 | `python ui.py` | V1 | Desktop GUI (Tkinter) |
 | `python web.py` | V1 | Web server on `:8080` + file manager |
@@ -75,7 +77,10 @@ ollama pull qwen2.5:1.5b
 python jarvis_v2_small.py
 
 # Or the web interface
-python web_v2.py
+python web_v2_small.py
+
+# Or the desktop GUI
+python ui2_small.py
 ```
 
 **Tips:**
