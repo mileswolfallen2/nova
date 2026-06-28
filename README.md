@@ -2,6 +2,8 @@
 
 Multi-modal AI assistant with desktop GUI, web interface, and CLI. Runs on Ollama.
 
+<a herf="Can you tell me about world events?">demo</a>
+
 ## Quick Start
 
 ```bash
