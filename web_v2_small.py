@@ -4,6 +4,8 @@
 import os
 import sys
 import asyncio
+import ssl
+from pathlib import Path
 
 if "--ui" not in sys.argv:
     sys.argv.insert(1, "--ui")
@@ -68,8 +70,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <script>
 const chat=document.getElementById('chat'),inp=document.getElementById('input'),sendBtn=document.getElementById('sendBtn'),dot=document.getElementById('dot'),stText=document.getElementById('stText');
+const STORAGE_KEY='nova_v2_small_chat';
 let busy=!1;
-function addMsg(t,role){
+function save(){
+  const msgs=[];
+  for(const el of chat.children){
+    if(el.id==='ld')continue;
+    let role='a',text='';
+    if(el.classList.contains('u'))role='u';
+    else if(el.classList.contains('tool')){role='tool';text=el.innerHTML}
+    else if(el.classList.contains('err')){role='err';text=el.innerHTML}
+    else text=el.textContent;
+    if(!text&&role!=='a')continue;
+    msgs.push({r:role,t:text||el.textContent});
+  }
+  try{localStorage.setItem(STORAGE_KEY,JSON.stringify(msgs))}catch{}
+}
+function addMsg(t,role,saveMsg=!0){
   const d=document.createElement('div');
   if(role==='tool'||role==='err'){
     d.className='msg '+role;
@@ -80,8 +97,21 @@ function addMsg(t,role){
   }
   chat.appendChild(d);
   chat.scrollTop=chat.scrollHeight;
+  if(saveMsg)save();
   return d;
 }
+// restore saved messages
+try{
+  const saved=JSON.parse(localStorage.getItem(STORAGE_KEY)||'[]');
+  if(saved.length){
+    for(const m of saved){
+      if(m.r==='tool'||m.r==='err')addMsg(m.t,m.r,!1);
+      else addMsg(m.t,m.r,!1);
+    }
+  }else{
+    addMsg('NOVA V2 Small ready (JSON-mode). Model: qwen2.5:1.5b','a',!1);
+  }
+}catch{addMsg('NOVA V2 Small ready (JSON-mode). Model: qwen2.5:1.5b','a',!1)}
 function ld(on){
   const e=document.getElementById('ld');
   if(e)e.remove();
@@ -113,7 +143,6 @@ sendBtn.addEventListener('click',send);
 inp.addEventListener('keydown',e=>{if(e.key==='Enter')send()});
 async function st(){try{const r=await fetch('/api/status');const d=await r.json();dot.className='dot '+(d.ollama?'on':'off');stText.textContent=d.ollama?'online':'offline'}catch{dot.className='dot off';stText.textContent='offline'}}
 st();setInterval(st,15000);
-addMsg('NOVA V2 Small ready (JSON-mode). Model: qwen2.5:1.5b','a');
 </script>
 </body>
 </html>"""
@@ -180,6 +209,27 @@ async def handle_chat(request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+def ensure_self_signed_cert(cert_dir):
+    cert_path = cert_dir / "cert.pem"
+    key_path = cert_dir / "key.pem"
+    if cert_path.exists() and key_path.exists():
+        return cert_path, key_path
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    import subprocess
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key_path),
+             "-out", str(cert_path), "-days", "3650", "-nodes",
+             "-subj", "/CN=nova.local", "-addext", "subjectAltName=DNS:nova.local"],
+            check=True, capture_output=True,
+        )
+        print("  Self-signed certificate created")
+        return cert_path, key_path
+    except Exception as e:
+        print(f"  Could not generate certificate ({e}), falling back to HTTP")
+        return None, None
+
+
 def main():
     app = web.Application()
     app.router.add_get("/", handle_index)
@@ -190,15 +240,26 @@ def main():
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
 
+    cert_dir = Path(__file__).parent / ".certs"
+    cert_path, key_path = ensure_self_signed_cert(cert_dir)
+
+    if cert_path and key_path:
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain(cert_path, key_path)
+        scheme = "https"
+    else:
+        ssl_ctx = None
+        scheme = "http"
+
     print(f"\n  NOVA V2 Small Web Server (JSON-mode)")
     print(f"  {'─' * 40}")
     print(f"  Model:   {jarvis_v2_small.CHAT_MODEL}")
-    print(f"  Local:   http://localhost:{PORT}")
-    print(f"  Network: http://{local_ip}:{PORT}")
-    print(f"  Phone:   http://{local_ip}:{PORT}")
+    print(f"  Local:   {scheme}://localhost:{PORT}")
+    print(f"  Network: {scheme}://{local_ip}:{PORT}")
+    print(f"  Phone:   {scheme}://{local_ip}:{PORT}")
     print()
 
-    web.run_app(app, host=HOST, port=PORT, print=lambda _: None)
+    web.run_app(app, host=HOST, port=PORT, ssl_context=ssl_ctx, print=lambda _: None)
 
 
 if __name__ == "__main__":
