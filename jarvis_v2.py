@@ -28,7 +28,7 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write or create a text file in the workspace folder.",
+            "description": "Write or create a text file in the workspace folder. Only use when the user explicitly asks to save, write, create, or store something to a file. Do NOT use for casual chat or thanks.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -57,7 +57,7 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web and return current results. Use for current time, date, news, facts, or any question needing live data.",
+            "description": "Search the web for current information. Only use for real-time data, news, or facts you genuinely don't know. Do NOT use for greetings, casual chat, weather, or system status — use the dedicated tools instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -98,18 +98,33 @@ TOOL_MAP = {
 
 AGENT_SYSTEM_PROMPT = f"""You are NOVA V2, an AI agent on Miles Allen's computer.
 
-Available tools:
-- web_search(query) — search the web. Use for time, date, news, facts, weather, or current info.
+# Available Tools
+
+- web_search(query) — search the web for current info. Use ONLY for real-time data, news, or facts you don't know.
 - write_file(filename, content) — save content to a file in the workspace.
 - read_file(filename) — read a file from the workspace.
 - get_system_status() — get CPU, RAM, and disk info.
 - get_weather() — get current weather for the configured location.
 
-Rules:
-- When the user asks to save/write/create a file, call write_file.
-- Call the actual tool — do not just describe what you would do.
-- After a tool result, either call another tool or respond to the user.
-- Keep responses concise. Workspace: {WORKSPACE}"""
+# When to Use web_search
+
+DO call web_search when the user asks about:
+- Current news, events, or real-time information
+- Facts you are uncertain about that need verification
+- Specific questions requiring up-to-date data
+
+DO NOT call web_search for:
+- Greetings, salutations, or casual conversation — just respond directly
+- Questions you can answer from your own knowledge
+- Weather — use get_weather instead
+- System status — use get_system_status instead
+
+# Behavior Rules
+
+- After a tool returns a result, incorporate it naturally into your response. Never echo the tool result verbatim — summarize it in your own words. Never say you couldn't find information when a tool already returned relevant results.
+- Call only the minimum necessary tools. Do not chain extra tools.
+- For greetings, thanks, or casual conversation — respond conversationally without calling any tools.
+- Be concise and conversational. Workspace: {WORKSPACE}"""
 
 
 # ── LLM call ─────────────────────────────────────────────────────────────
@@ -118,7 +133,7 @@ def call_llm(messages, tools=None):
     payload = {
         "model": CHAT_MODEL,
         "messages": messages,
-        "options": {"temperature": 0.1},
+        "options": {"temperature": 0.0},
         "stream": False,
     }
     if tools:
@@ -132,9 +147,18 @@ def call_llm(messages, tools=None):
 
 # ── Agent loop ───────────────────────────────────────────────────────────
 
+_CASUAL = frozenset({"thx", "thanks", "ty", "ok", "okay", "cool", "nice", "k", "kk", "np", "got it", "sure", "thanks!", "ty!", "k thanks", "ok thanks", "okay thanks"})
+
 def agent_process(user_input: str, messages: list | None = None) -> tuple[str, list]:
     if messages is None:
         messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+
+    stripped = user_input.lower().strip()
+    if stripped in _CASUAL:
+        reply = "You're welcome!" if stripped in ("thx", "thanks", "ty", "thanks!", "ty!", "k thanks", "ok thanks", "okay thanks") else "👍"
+        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "assistant", "content": reply})
+        return reply, messages
 
     messages.append({"role": "user", "content": user_input})
 
@@ -171,14 +195,14 @@ def agent_process(user_input: str, messages: list | None = None) -> tuple[str, l
                     except Exception as e:
                         result = f"[Error: {e}]"
 
-            messages.append({
-                "role": "tool",
-                "name": fn_name,
-                "content": str(result),
-            })
+                messages.append({
+                    "role": "tool",
+                    "name": fn_name,
+                    "content": str(result),
+                })
 
-            if fn_name == "write_file":
-                return result, messages
+                if fn_name == "write_file":
+                    return result, messages
 
             continue
 

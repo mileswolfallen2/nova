@@ -163,12 +163,15 @@ async def handle_chat(request):
             steps = []
             for m in new_msgs:
                 role = m["role"]
-                content = m.get("content", "")
-                if role == "tool":
-                    steps.append({"type": "tool", "tool": m.get("name", ""), "args": content[:200]})
-                elif role == "assistant" and content:
-                    if not any(s.get("type") == "result" for s in steps):
-                        pass
+                if role == "assistant":
+                    tc = m.get("tool_calls")
+                    if tc:
+                        for t in tc:
+                            fn = t["function"]["name"]
+                            args = t["function"]["arguments"]
+                            steps.append({"type": "tool", "tool": fn, "args": str(args)[:200]})
+                elif role == "tool":
+                    steps.append({"type": "result", "result": m.get("content", "")[:300]})
             return {"reply": reply, "steps": steps}
 
         result = await loop.run_in_executor(None, run)
